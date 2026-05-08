@@ -6,7 +6,7 @@ I made this quickly because I wanted a faster way to inspect 3D assets without o
 
 It opens `.glb`, `.gltf`, `.fbx`, and `.zip` files, including zipped glTF/GLB bundles. It also includes a small bundled sample model so the repo works immediately after install. Optional Poly Haven HDRIs can be downloaded by the app when internet is available, but the viewer still works without them.
 
-This does not require Google Chrome. It runs as a Python/PySide6 desktop app, with QtWebEngine providing the embedded browser surface for the local Three.js viewer.
+It runs as a small Python/PySide6 desktop app with an embedded QtWebEngine view for the local Three.js viewer.
 
 ## Quick start
 
