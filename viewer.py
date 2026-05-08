@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 import zipfile
 from http.server import SimpleHTTPRequestHandler
 from pathlib import Path
@@ -63,6 +64,7 @@ HDRI_ASSETS = [
     ("Night City", "neuer_zollhof_2k.hdr"),
 ]
 HDRI_CACHE_DIR = ROOT / "runtime" / "hdri_cache"
+HDRI_DOWNLOAD_BASE = "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/2k/{filename}"
 
 
 def log_line(message: str) -> None:
@@ -252,6 +254,28 @@ def place_on_right_monitor(window: QMainWindow, width: int, height: int) -> None
 def place_on_right_monitor_physical(window: QMainWindow) -> None:
     # Public build avoids hard-coded monitor coordinates. Qt geometry restore/placement is enough.
     return
+
+
+def download_missing_hdris() -> None:
+    """Best-effort HDRI cache fill for normal interactive launches."""
+    HDRI_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    for label, filename in HDRI_ASSETS:
+        if filename is None:
+            continue
+        path = HDRI_CACHE_DIR / filename
+        if path.exists() and path.stat().st_size > 0:
+            continue
+        url = HDRI_DOWNLOAD_BASE.format(filename=filename)
+        try:
+            log_line(f"hdri download start label={label} url={url}")
+            req = urllib.request.Request(url, headers={"User-Agent": "r7321-3d-viewer/1.0"})
+            tmp = path.with_suffix(path.suffix + ".download")
+            with urllib.request.urlopen(req, timeout=45) as response, tmp.open("wb") as fh:
+                shutil.copyfileobj(response, fh)
+            tmp.replace(path)
+            log_line(f"hdri download ok label={label} file={path.name} bytes={path.stat().st_size}")
+        except Exception as exc:
+            log_line(f"hdri download failed label={label} file={filename}: {exc}")
 
 
 def build_hdri_options() -> list[dict]:
@@ -1351,6 +1375,7 @@ def main() -> int:
     if missing_vendor:
         print(f"viewer vendor runtime missing: {missing_vendor[0]}", file=sys.stderr)
         return 3
+    download_missing_hdris()
     mimetypes.add_type("model/gltf-binary", ".glb")
     mimetypes.add_type("model/gltf+json", ".gltf")
     mimetypes.add_type("application/octet-stream", ".fbx")
