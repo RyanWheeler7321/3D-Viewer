@@ -1,6 +1,6 @@
 # 3D Viewer
 
-A small local desktop viewer for `.glb`, `.gltf`, and zipped glTF model bundles.
+A small local desktop viewer for `.glb`, `.gltf`, `.fbx`, and zipped glTF model bundles.
 
 It is built with Python, PySide6 QtWebEngine, and vendored Three.js. It is meant for quick asset inspection: orbit, pan, zoom, frame angles, wireframe, clay mode, lighting modes, optional HDRIs, and a frameless always-on-top window.
 
@@ -39,6 +39,7 @@ The bundled sample is Poly Haven's `planter_box_01` model at 1k resolution. It i
 - `T`: always-on-top
 - `P`: pause WebGL
 - `I`: write a process snapshot to the log
+- `Ctrl+O`: open another model in the same viewer window
 - `O`: open the model folder
 - `Esc`: close
 
@@ -54,7 +55,7 @@ python scripts/download_hdris.py
 
 ## Explorer context menu on Windows
 
-Install the right-click entry for `.glb`, `.gltf`, and `.zip` files:
+Install the right-click entry for `.glb`, `.gltf`, `.fbx`, and `.zip` files:
 
 ```bash
 python scripts/install_context_menu.py

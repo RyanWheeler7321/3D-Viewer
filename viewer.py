@@ -39,13 +39,14 @@ os.environ.setdefault(
 
 from PySide6.QtCore import QUrl, Qt, QTimer, QByteArray
 from PySide6.QtGui import QAction, QGuiApplication, QIcon, QKeySequence
-from PySide6.QtWidgets import QApplication, QMainWindow
+from PySide6.QtWidgets import QApplication, QFileDialog, QMainWindow
 from PySide6.QtWebEngineCore import QWebEnginePage
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 ROOT = Path(__file__).resolve().parent
 VENDOR_THREE = ROOT / "vendor" / "three" / "build" / "three.module.js"
 VENDOR_HDR_LOADER = ROOT / "vendor" / "three" / "examples" / "jsm" / "loaders" / "HDRLoader.js"
+VENDOR_FBX_LOADER = ROOT / "vendor" / "three" / "examples" / "jsm" / "loaders" / "FBXLoader.js"
 LOG_PATH = ROOT / "runtime" / "logs" / "3d_viewer.log"
 STATE_PATH = ROOT / "runtime" / "window_state.json"
 LAST_MODEL_PATH = ROOT / "runtime" / "last_model.json"
@@ -267,11 +268,12 @@ def build_hdri_options() -> list[dict]:
     return options
 
 
-def build_html(model_name: str, model_url: str, model_path: Path) -> str:
+def build_html(model_name: str, model_url: str, model_path: Path, model_kind: str) -> str:
     title = html.escape(model_name)
     path_text = html.escape(str(model_path))
     hdri_json = json.dumps(build_hdri_options(), ensure_ascii=False)
     model_url_json = json.dumps(model_url)
+    model_kind_json = json.dumps(model_kind)
     template = r'''<!doctype html>
 <html>
 <head>
@@ -304,8 +306,10 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
+import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
 
 const MODEL_URL = __MODEL_URL__;
+const MODEL_KIND = __MODEL_KIND__;
 const HDRI_OPTIONS = __HDRI_OPTIONS__;
 const root = document.getElementById('viewer');
 const status = document.getElementById('status');
@@ -807,8 +811,15 @@ applyLighting();
 applyBackground();
 applyHdri(false);
 
-new GLTFLoader().load(MODEL_URL, (gltf) => {
-  model = gltf.scene;
+function activeLoader() {
+  if (MODEL_KIND === 'fbx') return new FBXLoader();
+  return new GLTFLoader();
+}
+function loadedRoot(loaded) {
+  return MODEL_KIND === 'fbx' ? loaded : loaded.scene;
+}
+activeLoader().load(MODEL_URL, (loaded) => {
+  model = loadedRoot(loaded);
   scene.add(model);
   refreshBounds();
   frameModel(false);
@@ -826,11 +837,11 @@ new GLTFLoader().load(MODEL_URL, (gltf) => {
       }
     }
   }
-  log(`model loaded meshes=${meshes.length} materials=${materialCount} textures=${textureCount} ${rendererMemoryText()}`);
+  log(`model loaded kind=${MODEL_KIND} meshes=${meshes.length} materials=${materialCount} textures=${textureCount} ${rendererMemoryText()}`);
   setStatus('Loaded. Orbit LMB, smooth zoom MMB drag/wheel, pan RMB.', true, 2400);
 }, undefined, (err) => {
   console.error(err);
-  log(`model load failed: ${err}`);
+  log(`model load failed kind=${MODEL_KIND}: ${err}`);
   setStatus('Model failed to load.');
 });
 
@@ -949,6 +960,7 @@ window.viewerToggleRenderPause = () => { renderPaused = !renderPaused; if (!rend
         .replace("__TITLE__", title)
         .replace("__PATH__", path_text)
         .replace("__MODEL_URL__", model_url_json)
+        .replace("__MODEL_KIND__", model_kind_json)
         .replace("__HDRI_OPTIONS__", hdri_json)
     )
 
@@ -958,6 +970,9 @@ class ViewerWindow(QMainWindow):
     def __init__(self, model_path: Path, display_path: Path, server_root: Path, port: int) -> None:
         super().__init__()
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
+        self.server_root = server_root
+        self.port = port
+        self.runtime_root = STATE_PATH.parent
         self.model_path = display_path
         self.served_model_path = model_path
         self._diag_last_wall = time.perf_counter()
@@ -978,12 +993,49 @@ class ViewerWindow(QMainWindow):
         self.setCentralWidget(self.view)
         self.resize(1500, 900)
         self.setStyleSheet("background:#050608;")
-        model_rel = model_path.absolute().relative_to(server_root.resolve()).as_posix()
-        model_url = "/" + quote(model_rel)
-        html_path = server_root / "runtime" / "viewer.html"
-        html_path.write_text(build_html(display_path.name, model_url, display_path), encoding="utf-8")
-        self.view.load(QUrl(f"http://127.0.0.1:{port}/runtime/viewer.html"))
+        self._load_served_model(model_path, display_path)
         self._add_shortcuts()
+
+    def _viewer_html_path(self) -> Path:
+        return self.runtime_root / "viewer.html"
+
+    def _viewer_url(self) -> QUrl:
+        rel = self._viewer_html_path().resolve().relative_to(self.server_root.resolve()).as_posix()
+        return QUrl(f"http://127.0.0.1:{self.port}/{rel}")
+
+    def _load_served_model(self, served_model_path: Path, display_path: Path) -> None:
+        self.model_path = display_path
+        self.served_model_path = served_model_path
+        self.setWindowTitle(f"3D Viewer - {display_path.name}")
+        model_rel = served_model_path.absolute().relative_to(self.server_root.resolve()).as_posix()
+        model_url = "/" + quote(model_rel)
+        model_kind = served_model_path.suffix.lower().lstrip(".")
+        html_path = self._viewer_html_path()
+        html_path.parent.mkdir(parents=True, exist_ok=True)
+        html_path.write_text(build_html(display_path.name, model_url, display_path, model_kind), encoding="utf-8")
+        self.view.load(self._viewer_url())
+
+    def open_model_dialog(self) -> None:
+        start_dir = str(self.model_path.parent if self.model_path else Path.home())
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open 3D Model",
+            start_dir,
+            "3D Models (*.glb *.gltf *.fbx *.zip);;glTF (*.glb *.gltf);;FBX (*.fbx);;ZIP bundles (*.zip);;All Files (*)",
+        )
+        if selected:
+            self.open_model_path(Path(selected))
+
+    def open_model_path(self, model_path: Path) -> None:
+        try:
+            model_path = model_path.expanduser().resolve()
+            resolved_model = resolve_model_input(model_path, self.runtime_root)
+            served_model = prepare_served_model(resolved_model, self.runtime_root)
+            save_last_model(model_path)
+            log_line(f"open model selected={model_path} resolved={resolved_model} served={served_model}")
+            self._load_served_model(served_model, model_path)
+        except Exception as exc:
+            log_line(f"open model failed model={model_path}: {exc}")
 
     def _log_qt_diagnostics(self) -> None:
         now = time.perf_counter()
@@ -1063,6 +1115,7 @@ class ViewerWindow(QMainWindow):
             ("Toggle Topmost", "T", self.toggle_topmost),
             ("Pause WebGL", "P", self.toggle_webgl_pause),
             ("Log Process Snapshot", "I", self.log_process_snapshot),
+            ("Open Model", "Ctrl+O", self.open_model_dialog),
             ("Open Folder", "O", lambda: open_folder(self.model_path)),
             ("Close", "Esc", self.close),
         ]
@@ -1226,7 +1279,7 @@ def find_best_extracted_model(root: Path) -> Path | None:
 def resolve_model_input(model_path: Path, runtime_root: Path) -> Path:
     suffix = model_path.suffix.lower()
     if suffix != ".zip":
-        if suffix not in {".glb", ".gltf"}:
+        if suffix not in {".glb", ".gltf", ".fbx"}:
             raise ValueError(f"unsupported model type: {model_path.suffix or model_path.name}")
         return model_path
 
@@ -1264,8 +1317,8 @@ def start_server(root: Path) -> tuple[ThreadingHTTPServer, int]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Open a lightweight GLB/GLTF/ZIP viewer.")
-    parser.add_argument("model", nargs="?", help="Path to .glb, .gltf, or .zip model bundle. Defaults to the bundled sample model.")
+    parser = argparse.ArgumentParser(description="Open a lightweight GLB/GLTF/FBX/ZIP viewer.")
+    parser.add_argument("model", nargs="?", help="Path to .glb, .gltf, .fbx, or .zip model bundle. Defaults to the bundled sample model.")
     parser.add_argument("--last", action="store_true", help="Reopen the last model launched in this viewer.")
     parser.add_argument("--width", type=int, default=1500)
     parser.add_argument("--height", type=int, default=900)
@@ -1294,12 +1347,13 @@ def main() -> int:
         print(f"model not found: {model_path}", file=sys.stderr)
         return 2
     save_last_model(model_path)
-    missing_vendor = [p for p in (VENDOR_THREE, VENDOR_HDR_LOADER) if not p.exists()]
+    missing_vendor = [p for p in (VENDOR_THREE, VENDOR_HDR_LOADER, VENDOR_FBX_LOADER) if not p.exists()]
     if missing_vendor:
         print(f"viewer vendor runtime missing: {missing_vendor[0]}", file=sys.stderr)
         return 3
     mimetypes.add_type("model/gltf-binary", ".glb")
     mimetypes.add_type("model/gltf+json", ".gltf")
+    mimetypes.add_type("application/octet-stream", ".fbx")
     mimetypes.add_type("application/octet-stream", ".hdr")
     # Serve the repo root so the local vendored Three.js runtime and prepared model bundle can both be reached.
     runtime_root = ROOT / "runtime"

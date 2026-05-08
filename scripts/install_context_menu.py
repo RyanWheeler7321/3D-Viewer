@@ -20,7 +20,7 @@ VIEWER = ROOT / "viewer.py"
 ICON = ROOT / "assets" / "rIcon.ico"
 LABEL = "Open in 3D Viewer"
 VERB = "r7321_3d_viewer"
-SUPPORTED_EXTS = [".glb", ".gltf", ".zip"]
+SUPPORTED_EXTS = [".glb", ".gltf", ".fbx", ".zip"]
 
 
 def pythonw_path() -> Path:
