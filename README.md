@@ -1,12 +1,12 @@
-# 3D Viewer
-
 ![3D Viewer screenshot grid](media/screenshots/3d_viewer_github_main.png)
+
+# 3D Viewer
 
 I made this quickly because I wanted a faster way to inspect 3D assets without opening Blender, Unity, or another heavier tool every time. It is meant for quick checks: open a model, move around it, test lighting, look at the texture and material read, check topology, and decide what to do with it next.
 
 It opens `.glb`, `.gltf`, `.fbx`, and `.zip` files, including zipped glTF/GLB bundles. Animated models can be played in place, bone-only animation files get a simple skeleton preview, and a small sidecar file can group model variants for quick comparison. The repo also includes a sample model and works without the optional Poly Haven HDRIs.
 
-It runs as a small Python/PySide6 desktop app with an embedded QtWebEngine view for the local Three.js viewer. I use it inside a larger 3D asset workflow, but the viewer is standalone.
+It runs as a small Python/PySide6 desktop app with an embedded QtWebEngine view for the local Three.js viewer.
 
 ## Quick start
 
