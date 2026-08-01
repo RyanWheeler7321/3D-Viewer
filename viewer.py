@@ -52,6 +52,7 @@ LOG_PATH = ROOT / "runtime" / "logs" / "3d_viewer.log"
 STATE_PATH = ROOT / "runtime" / "window_state.json"
 LAST_MODEL_PATH = ROOT / "runtime" / "last_model.json"
 ICON_PATH = ROOT / "assets" / "rIcon.ico"
+VIEWER_TEMPLATE_PATH = ROOT / "web" / "viewer.html"
 ACCENT = "#E3008C"
 
 HDRI_ASSETS = [
@@ -177,19 +178,34 @@ def save_window_state(window: QMainWindow) -> None:
 
 def restore_window_state(window: QMainWindow) -> bool:
     data = load_window_state()
-    geometry_hex = str(data.get("geometry_hex") or "")
-    if geometry_hex:
-        try:
-            return bool(window.restoreGeometry(QByteArray.fromHex(geometry_hex.encode("ascii"))))
-        except Exception:
-            pass
     rect = data.get("normal_rect")
+    expected_rect: tuple[int, int, int, int] | None = None
     if isinstance(rect, list) and len(rect) == 4:
         try:
             x, y, w, h = [int(v) for v in rect]
             if w > 200 and h > 200:
-                window.setGeometry(x, y, w, h)
-                return True
+                expected_rect = (x, y, w, h)
+        except Exception:
+            expected_rect = None
+
+    geometry_hex = str(data.get("geometry_hex") or "")
+    if geometry_hex:
+        try:
+            restored = bool(window.restoreGeometry(QByteArray.fromHex(geometry_hex.encode("ascii"))))
+            if restored:
+                if not expected_rect:
+                    return True
+                _, _, expected_w, expected_h = expected_rect
+                if abs(window.width() - expected_w) <= 8 and abs(window.height() - expected_h) <= 8:
+                    return True
+        except Exception:
+            pass
+
+    if expected_rect:
+        try:
+            x, y, w, h = expected_rect
+            window.setGeometry(x, y, w, h)
+            return True
         except Exception:
             pass
     return False
@@ -241,19 +257,45 @@ def resolve_last_model() -> Path | None:
     return load_last_model_from_state() or load_last_model_from_log()
 
 
+def monitor_label(screen) -> str:
+    if screen is None:
+        return "unknown"
+    geometry = screen.geometry()
+    return (
+        f"{screen.name()} "
+        f"{geometry.x()},{geometry.y()},{geometry.width()}x{geometry.height()} "
+        f"{screen.refreshRate():.1f}Hz"
+    )
+
+
+def place_on_screen(window: QMainWindow, screen, width: int, height: int) -> None:
+    if screen is None:
+        return
+    geometry = screen.availableGeometry()
+    target_width = min(width, max(200, geometry.width() - 40))
+    target_height = min(height, max(200, geometry.height() - 40))
+    x = geometry.x() + max(20, (geometry.width() - target_width) // 2)
+    y = geometry.y() + max(20, (geometry.height() - target_height) // 2)
+    window.setGeometry(x, y, target_width, target_height)
+
+
 def place_on_right_monitor(window: QMainWindow, width: int, height: int) -> None:
     screens = QGuiApplication.screens()
-    # Prefer the rightmost display when one exists.
     screen = max(screens, key=lambda s: s.geometry().x()) if screens else QGuiApplication.primaryScreen()
-    geo = screen.availableGeometry()
-    x = geo.x() + max(20, (geo.width() - width) // 2)
-    y = geo.y() + max(20, (geo.height() - height) // 2)
-    window.setGeometry(x, y, min(width, geo.width() - 40), min(height, geo.height() - 40))
+    place_on_screen(window, screen, width, height)
 
 
-def place_on_right_monitor_physical(window: QMainWindow) -> None:
-    # Public build avoids hard-coded monitor coordinates. Qt geometry restore/placement is enough.
-    return
+def place_on_monitor(window: QMainWindow, width: int, height: int, preference: str) -> None:
+    if preference == "right":
+        place_on_right_monitor(window, width, height)
+        return
+
+    screens = QGuiApplication.screens()
+    if preference == "fast" and screens:
+        screen = max(screens, key=lambda candidate: candidate.refreshRate())
+    else:
+        screen = QGuiApplication.primaryScreen()
+    place_on_screen(window, screen, width, height)
 
 
 def download_missing_hdris() -> None:
@@ -292,693 +334,79 @@ def build_hdri_options() -> list[dict]:
     return options
 
 
-def build_html(model_name: str, model_url: str, model_path: Path, model_kind: str) -> str:
+VARIANT_SIDECAR_SUFFIX = ".viewer_variants.json"
+
+
+def _resolve_variant_path(manifest_path: Path, value: str) -> Path | None:
+    if not value:
+        return None
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = manifest_path.parent / path
+    try:
+        return path.resolve()
+    except Exception:
+        return path.absolute()
+
+
+def _variant_manifest_candidates(model_path: Path) -> list[Path]:
+    candidates = [
+        model_path.with_name(model_path.stem + VARIANT_SIDECAR_SUFFIX),
+        model_path.parent / "viewer_variants.json",
+    ]
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for candidate in candidates:
+        try:
+            key = candidate.resolve()
+        except Exception:
+            key = candidate.absolute()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    return unique
+
+
+def load_preview_variants(model_path: Path) -> tuple[list[dict], int, Path | None]:
+    current = model_path.expanduser().resolve()
+    for manifest_path in _variant_manifest_candidates(current):
+        if not manifest_path.exists():
+            continue
+        try:
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            log_line(f"avatar variant manifest failed path={manifest_path}: {exc}")
+            continue
+        variants: list[dict] = []
+        for item in data.get("variants", []):
+            if isinstance(item, str):
+                item = {"path": item}
+            if not isinstance(item, dict):
+                continue
+            path = _resolve_variant_path(manifest_path, str(item.get("path", "")))
+            if not path or not path.exists():
+                continue
+            label = str(item.get("label") or path.stem).strip() or path.stem
+            variants.append({"label": label, "path": path})
+        if not variants:
+            continue
+        index = 0
+        for idx, variant in enumerate(variants):
+            if variant["path"] == current:
+                index = idx
+                break
+        return variants, index, manifest_path
+    return [], -1, None
+
+def build_html(model_name: str, model_url: str, model_path: Path, model_kind: str, initial_view_state: dict | None = None) -> str:
     title = html.escape(model_name)
     path_text = html.escape(str(model_path))
     hdri_json = json.dumps(build_hdri_options(), ensure_ascii=False)
     model_url_json = json.dumps(model_url)
     model_kind_json = json.dumps(model_kind)
-    template = r'''<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<script type="importmap">
-{"imports":{"three":"/vendor/three/build/three.module.js","three/addons/":"/vendor/three/examples/jsm/"}}
-</script>
-<style>
-html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #050608; color: #e8e8ee; font-family: Segoe UI, system-ui, sans-serif; }
-#bar { position: fixed; top: 0; left: 0; right: 0; height: 48px; display: flex; align-items: center; gap: 18px; padding: 0 18px; background: rgba(8,10,14,.92); border-bottom: 1px solid rgba(227,0,140,.42); z-index: 2; -webkit-font-smoothing: antialiased; text-rendering: geometricPrecision; }
-#title { color: __ACCENT__; font-weight: 900; font-size: 21px; white-space: nowrap; letter-spacing: .1px; }
-#path { opacity: .9; font-size: 16px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-#keys { margin-left: auto; opacity: .9; font-size: 14px; font-weight: 700; white-space: nowrap; }
-#viewer { position: fixed; inset: 0; background: #101722; }
-#status { position: fixed; left: 14px; bottom: 12px; padding: 7px 10px; background: rgba(8,10,14,.78); border: 1px solid rgba(255,255,255,.12); border-radius: 8px; color: #f0f0f4; font-size: 14px; font-weight: 700; z-index: 3; opacity: 1; transition: opacity .22s ease; text-shadow: 0 1px 2px #000; pointer-events: none; }
-#modePopup { position: fixed; left: 14px; top: 56px; padding: 7px 10px; background: rgba(8,10,14,.82); border: 1px solid rgba(227,0,140,.36); border-radius: 8px; color: #fff; font-size: 14px; font-weight: 800; z-index: 4; opacity: 0; transform: translateY(-4px); transition: opacity .16s ease, transform .16s ease; text-shadow: 0 1px 2px #000; pointer-events: none; }
-#modePopup.show { opacity: 1; transform: translateY(0); }
-#diagnostics { position: fixed; right: 12px; bottom: 12px; min-width: 270px; padding: 9px 11px; background: rgba(4,5,7,.82); border: 1px solid rgba(227,0,140,.36); border-radius: 9px; color: #f4f4f8; font: 700 12px/1.35 Consolas, monospace; white-space: pre; z-index: 5; pointer-events: none; display: none; }
-</style>
-</head>
-<body>
-<div id="viewer"></div>
-<div id="bar"><div id="title">__TITLE__</div><div id="path">__PATH__</div><div id="keys">LMB orbit | MMB zoom | RMB pan | F frame | A auto | W wire | X xray | C clay | H HDRI | L light | B bg</div></div>
-<div id="status">Loading model...</div>
-<div id="modePopup"></div>
-<div id="diagnostics"></div>
-<script type="module">
-import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
-import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
-
-const MODEL_URL = __MODEL_URL__;
-const MODEL_KIND = __MODEL_KIND__;
-const HDRI_OPTIONS = __HDRI_OPTIONS__;
-const root = document.getElementById('viewer');
-const status = document.getElementById('status');
-const modePopup = document.getElementById('modePopup');
-const diagnostics = document.getElementById('diagnostics');
-let statusFadeTimer = 0;
-let popupTimer = 0;
-let diagnosticsVisible = false;
-let renderPaused = false;
-function log(text) { console.log(`[viewer] ${text}`); }
-function setStatus(text, fade = false, fadeMs = 1000) {
-  status.style.opacity = '1';
-  status.textContent = text;
-  clearTimeout(statusFadeTimer);
-  if (fade) statusFadeTimer = setTimeout(() => { status.style.opacity = '0'; }, fadeMs);
-}
-function showModePopup(text) {
-  modePopup.textContent = text;
-  modePopup.classList.add('show');
-  clearTimeout(popupTimer);
-  popupTimer = setTimeout(() => modePopup.classList.remove('show'), 1150);
-}
-
-const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(32, window.innerWidth / window.innerHeight, 0.01, 10000);
-const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, premultipliedAlpha: false, powerPreference: 'high-performance' });
-renderer.setPixelRatio(1.0);
-renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.outputColorSpace = THREE.SRGBColorSpace;
-renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.05;
-renderer.setClearColor(0x101722, 1);
-renderer.info.autoReset = false;
-root.appendChild(renderer.domElement);
-const qualityModes = [
-  { label: 'performance', pixelRatio: 1.0 },
-  { label: 'balanced', pixelRatio: 1.25 },
-  { label: 'sharp', pixelRatio: 1.5 }
-];
-let qualityIndex = 0;
-function applyQuality(show = true) {
-  const q = qualityModes[qualityIndex];
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, q.pixelRatio));
-  renderer.setSize(window.innerWidth, window.innerHeight);
-  markDirty();
-  log(`quality=${q.label} pr=${renderer.getPixelRatio().toFixed(2)}`);
-  if (show) showModePopup(`Quality ${qualityIndex + 1}/${qualityModes.length}: ${q.label}`);
-}
-function toggleQuality() {
-  qualityIndex = (qualityIndex + 1) % qualityModes.length;
-  applyQuality(true);
-}
-
-const controls = new OrbitControls(camera, renderer.domElement);
-controls.enableDamping = true;
-controls.dampingFactor = 0.08;
-controls.screenSpacePanning = true;
-controls.mouseButtons = {
-  LEFT: THREE.MOUSE.ROTATE,
-  MIDDLE: -1,
-  RIGHT: THREE.MOUSE.PAN
-};
-let controlsDragging = false;
-let middleZooming = false;
-let middleZoomPointerId = null;
-let middleZoomY = 0;
-function applyMiddleDragZoom(clientY) {
-  const dy = clientY - middleZoomY;
-  if (Math.abs(dy) < 0.25) return;
-  middleZoomY = clientY;
-  const offset = camera.position.clone().sub(controls.target);
-  const oldDistance = Math.max(0.0001, offset.length());
-  const scale = Math.exp(dy * 0.006 * controls.zoomSpeed);
-  const newDistance = THREE.MathUtils.clamp(oldDistance * scale, controls.minDistance, controls.maxDistance);
-  camera.position.copy(controls.target).add(offset.normalize().multiplyScalar(newDistance));
-  camera.updateMatrixWorld();
-  controls.update(0);
-  markDirty();
-}
-renderer.domElement.addEventListener('pointerdown', (event) => {
-  if (event.button !== 1) return;
-  event.preventDefault();
-  event.stopImmediatePropagation();
-  middleZooming = true;
-  middleZoomPointerId = event.pointerId;
-  middleZoomY = event.clientY;
-  controlsDragging = true;
-  renderer.domElement.setPointerCapture?.(event.pointerId);
-}, { passive: false, capture: true });
-renderer.domElement.addEventListener('pointermove', (event) => {
-  if (!middleZooming || event.pointerId !== middleZoomPointerId) return;
-  event.preventDefault();
-  event.stopImmediatePropagation();
-  applyMiddleDragZoom(event.clientY);
-}, { passive: false, capture: true });
-function endMiddleZoom(event) {
-  if (!middleZooming || event.pointerId !== middleZoomPointerId) return;
-  event.preventDefault();
-  event.stopImmediatePropagation();
-  middleZooming = false;
-  middleZoomPointerId = null;
-  controlsDragging = false;
-  renderer.domElement.releasePointerCapture?.(event.pointerId);
-  markDirty();
-}
-renderer.domElement.addEventListener('pointerup', endMiddleZoom, { passive: false, capture: true });
-renderer.domElement.addEventListener('pointercancel', endMiddleZoom, { passive: false, capture: true });
-renderer.domElement.addEventListener('auxclick', (event) => {
-  if (event.button === 1) { event.preventDefault(); event.stopImmediatePropagation(); }
-}, { passive: false, capture: true });
-controls.addEventListener('start', () => { controlsDragging = true; markDirty(); });
-controls.addEventListener('end', () => { controlsDragging = false; markDirty(); });
-controls.zoomSpeed = 1.1;
-log('mouse controls: left rotate, middle drag custom smooth zoom, wheel zoom, right pan');
-
-const hemiLight = new THREE.HemisphereLight(0xffffff, 0x2a3140, 1.3);
-scene.add(hemiLight);
-const keyLight = new THREE.DirectionalLight(0xffffff, 2.15);
-keyLight.position.set(2.8, 4.5, 3.5);
-scene.add(keyLight);
-const fillLight = new THREE.DirectionalLight(0xdde8ff, 0.4);
-fillLight.position.set(-3, 1.5, 2);
-scene.add(fillLight);
-const rimLight = new THREE.DirectionalLight(0xffd6f0, 0.85);
-rimLight.position.set(-4, 2, -3);
-scene.add(rimLight);
-
-let model = null;
-let bounds = new THREE.Box3();
-let center = new THREE.Vector3();
-let size = new THREE.Vector3();
-let radius = 1;
-let frameIndex = 0;
-let lastFrameTap = 0;
-let autoRotate = true;
-let autoRotatePauseUntil = 0;
-let framePulse = null;
-let wireMode = 0;
-let wireXray = false;
-let clayEnabled = false;
-let modelDirty = true;
-let lastRenderTime = performance.now();
-let windowFocused = true;
-let frameStatsWindowStart = performance.now();
-let frameStatsFrames = 0;
-let frameStatsMaxDt = 0;
-let frameStatsSpikeCount = 0;
-let frameStatsLastHidden = false;
-let lastSpikeLogAt = 0;
-let renderStatsTotalMs = 0;
-let renderStatsMaxMs = 0;
-let renderStatsFrames = 0;
-let renderedFramesTotal = 0;
-let frameStatsLastLogAt = performance.now();
-let animationHandle = 0;
-let delayedFrameTimer = 0;
-const renderModeLabel = 'continuous';
-const wireCache = new Map();
-let wireOverlays = [];
-let lightingIndex = 0;
-let backgroundIndex = 0;
-let hdriIndex = 0;
-let hdriLoadSerial = 0;
-let hdriBackgroundEnabled = false;
-const hdriCache = new Map();
-const hdrLoader = new HDRLoader();
-const pmremGenerator = new THREE.PMREMGenerator(renderer);
-pmremGenerator.compileEquirectangularShader();
-const frameResetMs = 3600;
-const backgroundModes = [
-  { label: 'cool slate', inner: '#27303e', mid: '#101722', outer: '#05070b' },
-  { label: 'light grey', inner: '#6b7078', mid: '#9aa0a8', outer: '#d3d5d8' },
-  { label: 'very light grey', inner: '#9fa4aa', mid: '#d4d6d9', outer: '#f2f2f1' },
-  { label: 'warm amber', inner: '#765135', mid: '#3a2418', outer: '#140c07' },
-  { label: 'green teal', inner: '#347365', mid: '#1b4841', outer: '#09201d' },
-  { label: 'violet dusk', inner: '#7450a0', mid: '#39214f', outer: '#16091f' }
-];
-const lightingModes = [
-  { label: 'studio', hemi: [0xffffff, 0x2a3140, 1.3], key: [0xffffff, 2.15, 2.8, 4.5, 3.5], fill: [0xdde8ff, .4, -3, 1.5, 2], rim: [0xffd6f0, .85, -4, 2, -3], exposure: 1.05 },
-  { label: 'flat inspect', hemi: [0xffffff, 0xffffff, 2.4], key: [0xffffff, .55, 0, 3, 4], fill: [0xffffff, .5, -3, 2, 2], rim: [0xffffff, .15, 0, 2, -4], exposure: .95 },
-  { label: 'hard forms', hemi: [0xb8caff, 0x151923, .45], key: [0xffffff, 3.4, 4, 5, 2], fill: [0x405080, .08, -4, 1, 1], rim: [0xffffff, .4, -3, 3, -4], exposure: 1.0 },
-  { label: 'rim silhouette', hemi: [0x657080, 0x07080a, .25], key: [0x7aa4ff, .75, 0, 2, 5], fill: [0x22304a, .1, 3, 1, 2], rim: [0xff2f9f, 3.1, -4, 2, -3], exposure: 1.05 },
-  { label: 'warm material', hemi: [0xffe7c8, 0x2b1b12, .9], key: [0xffcf95, 2.5, 3.2, 3.5, 4], fill: [0x6aa0ff, .3, -4, 1.3, 2], rim: [0xffffff, .55, -2, 2, -4], exposure: 1.0 },
-  { label: 'low dramatic', hemi: [0x8890a0, 0x060608, .18], key: [0xffffff, 2.9, -1, .6, 3.6], fill: [0x26305c, .05, 3, 1, 1], rim: [0xff2a65, 1.4, 4, 1.2, -3], exposure: 1.08 }
-];
-const originalMaterials = new Map();
-const clayMaterial = new THREE.MeshStandardMaterial({ color: 0xb8b3aa, roughness: 0.92, metalness: 0.0 });
-
-const frameAngles = [
-  { label: 'front', yaw: 0, pitch: 72 },
-  { label: 'front 3/4 right', yaw: 35, pitch: 72 },
-  { label: 'front 3/4 left', yaw: -35, pitch: 72 },
-  { label: 'right side', yaw: 90, pitch: 72 },
-  { label: 'left side', yaw: -90, pitch: 72 },
-  { label: 'back 3/4 right', yaw: 145, pitch: 72 },
-  { label: 'back 3/4 left', yaw: -145, pitch: 72 },
-  { label: 'back', yaw: 180, pitch: 72 },
-  { label: 'high front', yaw: 25, pitch: 48 },
-  { label: 'top', yaw: 0, pitch: 8 },
-  { label: 'bottom', yaw: 0, pitch: 166 }
-];
-
-function meshList() {
-  const out = [];
-  if (!model) return out;
-  model.traverse((obj) => {
-    if (obj.userData?.viewerWireOverlay) return;
-    if (obj.isMesh && obj.geometry?.getAttribute('position')) out.push(obj);
-  });
-  return out;
-}
-function refreshBounds() {
-  bounds.setFromObject(model);
-  bounds.getCenter(center);
-  bounds.getSize(size);
-  radius = Math.max(0.5, size.length() * 1.45);
-  controls.target.copy(center);
-  controls.minDistance = radius * 0.05;
-  controls.maxDistance = radius * 9;
-  camera.near = Math.max(0.001, radius / 500);
-  camera.far = radius * 80;
-  camera.updateProjectionMatrix();
-  log(`bounds size=${size.x.toFixed(3)},${size.y.toFixed(3)},${size.z.toFixed(3)} radius=${radius.toFixed(3)}`);
-}
-function positionForFrame(shot) {
-  const theta = THREE.MathUtils.degToRad(shot.yaw);
-  const phi = THREE.MathUtils.degToRad(shot.pitch);
-  const distance = radius;
-  return new THREE.Vector3(center.x + distance * Math.sin(phi) * Math.sin(theta), center.y + distance * Math.cos(phi), center.z + distance * Math.sin(phi) * Math.cos(theta));
-}
-function frameModel(manual = true) {
-  if (!model) return;
-  const now = performance.now();
-  if (!manual || (now - lastFrameTap) > frameResetMs) frameIndex = 0;
-  else frameIndex = (frameIndex + 1) % frameAngles.length;
-  lastFrameTap = now;
-  const shot = frameAngles[frameIndex];
-  camera.position.copy(positionForFrame(shot));
-  controls.target.copy(center);
-  controls.update();
-  if (manual) {
-    autoRotatePauseUntil = now + 2000;
-    startFramePulse();
-  }
-  markDirty();
-  setStatus(`Framed: ${shot.label}.`, true);
-}
-
-function startFramePulse() {
-  framePulse = {
-    start: performance.now(),
-    duration: 170,
-    baseFov: camera.fov,
-    amount: 1.25
-  };
-  markDirty();
-}
-function updateFramePulse(now) {
-  if (!framePulse) return false;
-  const t = Math.min(1, (now - framePulse.start) / framePulse.duration);
-  const easeOut = 1 - Math.pow(1 - t, 3.2);
-  camera.fov = framePulse.baseFov + framePulse.amount * (1 - easeOut);
-  camera.updateProjectionMatrix();
-  if (t >= 1) {
-    camera.fov = framePulse.baseFov;
-    camera.updateProjectionMatrix();
-    framePulse = null;
-  }
-  return true;
-}
-function resetCamera() { frameIndex = 0; lastFrameTap = 0; frameModel(false); }
-function toggleAutoRotate() { autoRotate = !autoRotate; markDirty(); setStatus(`Auto-rotate ${autoRotate ? 'on' : 'off'}.`, true); log(`autoRotate=${autoRotate}`); }
-function scheduleFrame() {
-  if (renderPaused || animationHandle) return;
-  animationHandle = requestAnimationFrame(animate);
-}
-function scheduleDelayedFrame(ms) {
-  if (renderPaused) return;
-  const delay = Math.max(0, Math.min(2200, ms));
-  if (delayedFrameTimer) clearTimeout(delayedFrameTimer);
-  delayedFrameTimer = setTimeout(() => { delayedFrameTimer = 0; scheduleFrame(); }, delay);
-}
-function markDirty() { modelDirty = true; scheduleFrame(); }
-function rendererMemoryText() {
-  const mem = renderer.info.memory;
-  const prog = renderer.info.programs ? renderer.info.programs.length : 0;
-  const heap = performance.memory ? ` heap=${Math.round(performance.memory.usedJSHeapSize / 1048576)}MB` : '';
-  return `geom=${mem.geometries} tex=${mem.textures} prog=${prog}${heap}`;
-}
-function normalizeRotationY(obj) {
-  const tau = Math.PI * 2;
-  if (!obj || Math.abs(obj.rotation.y) < tau) return;
-  obj.rotation.y = ((obj.rotation.y % tau) + tau) % tau;
-}
-function disposeWire() {
-  for (const overlay of wireOverlays) {
-    overlay.parent?.remove?.(overlay);
-    overlay.geometry?.dispose?.();
-    overlay.material?.dispose?.();
-  }
-  wireCache.clear();
-  wireOverlays = [];
-}
-function makeWireMaterial() {
-  const base = { color: clayEnabled ? 0x050505 : 0xff174f, depthTest: !wireXray, depthWrite: false, transparent: false, opacity: 1.0, toneMapped: false };
-  return new THREE.MeshBasicMaterial({ ...base, wireframe: true, side: THREE.DoubleSide });
-}
-function cloneGeometryForWire(mesh) {
-  const geometry = mesh.geometry.clone();
-  if (!geometry.getAttribute('normal')) geometry.computeVertexNormals();
-  const pos = geometry.getAttribute('position');
-  const normal = geometry.getAttribute('normal');
-  if (pos && normal && pos.count === normal.count) {
-    const epsilon = THREE.MathUtils.clamp(radius * 0.000045, 0.000015, 0.00026);
-    for (let i = 0; i < pos.count; i++) {
-      pos.setXYZ(i, pos.getX(i) + normal.getX(i) * epsilon, pos.getY(i) + normal.getY(i) * epsilon, pos.getZ(i) + normal.getZ(i) * epsilon);
-    }
-    pos.needsUpdate = true;
-  }
-  geometry.computeBoundingSphere();
-  return geometry;
-}
-function getWireEntry(mesh) {
-  let entry = wireCache.get(mesh.uuid);
-  if (!entry) { entry = { mesh, overlay: null }; wireCache.set(mesh.uuid, entry); }
-  return entry;
-}
-function getWireOverlay(mesh) {
-  const entry = getWireEntry(mesh);
-  if (entry.overlay) return entry.overlay;
-  const overlay = new THREE.Mesh(cloneGeometryForWire(mesh), makeWireMaterial());
-  overlay.userData.viewerWireOverlay = true;
-  overlay.name = 'viewer-wire-overlay';
-  overlay.matrixAutoUpdate = true;
-  overlay.position.set(0, 0, 0);
-  overlay.rotation.set(0, 0, 0);
-  overlay.scale.set(1, 1, 1);
-  overlay.frustumCulled = false;
-  overlay.visible = false;
-  mesh.add(overlay);
-  entry.overlay = overlay;
-  wireOverlays.push(overlay);
-  return overlay;
-}
-function applyWireAppearance() {
-  const color = clayEnabled ? 0x050505 : 0xff174f;
-  for (const overlay of wireOverlays) {
-    overlay.visible = false;
-    overlay.renderOrder = wireXray ? 999 : 30;
-    overlay.material.color.setHex(color);
-    overlay.material.depthTest = !wireXray;
-    overlay.material.needsUpdate = true;
-  }
-}
-function rebuildWire() {
-  if (!model) return;
-  let count = 0;
-  if (wireMode === 0) {
-    disposeWire();
-    markDirty();
-    log(`wire hidden mode=0 meshes=0 cached=0 xray=${wireXray} clay=${clayEnabled}`);
-    return;
-  }
-  applyWireAppearance();
-  for (const mesh of meshList()) {
-    const overlay = getWireOverlay(mesh);
-    overlay.visible = true;
-    overlay.renderOrder = wireXray ? 999 : 30;
-    overlay.material.color.setHex(clayEnabled ? 0x050505 : 0xff174f);
-    overlay.material.depthTest = !wireXray;
-    overlay.material.needsUpdate = true;
-    count += 1;
-  }
-  markDirty();
-  log(`wire shown mode=${wireMode} meshes=${count} cached=${wireOverlays.length} xray=${wireXray} clay=${clayEnabled}`);
-}
-function applyClay() {
-  for (const mesh of meshList()) {
-    if (!originalMaterials.has(mesh.uuid)) originalMaterials.set(mesh.uuid, mesh.material);
-    mesh.material = clayEnabled ? clayMaterial : originalMaterials.get(mesh.uuid);
-  }
-  rebuildWire();
-  markDirty();
-}
-function toggleWire() { wireMode = wireMode === 0 ? 1 : 0; rebuildWire(); const label = wireMode === 0 ? 'off' : 'tri surface'; setStatus(`Wireframe ${label}.`, true); markDirty(); }
-function toggleWireXray() { wireXray = !wireXray; rebuildWire(); setStatus(`Wireframe X-ray ${wireXray ? 'on' : 'off'}.`, true); markDirty(); }
-function toggleClay() { clayEnabled = !clayEnabled; applyClay(); setStatus(`Clay ${clayEnabled ? 'on' : 'off'}.`, true); log(`clay=${clayEnabled}`); }
-function applyLighting() {
-  const m = lightingModes[lightingIndex];
-  hemiLight.color.setHex(m.hemi[0]); hemiLight.groundColor.setHex(m.hemi[1]); hemiLight.intensity = m.hemi[2];
-  keyLight.color.setHex(m.key[0]); keyLight.intensity = m.key[1]; keyLight.position.set(m.key[2], m.key[3], m.key[4]);
-  fillLight.color.setHex(m.fill[0]); fillLight.intensity = m.fill[1]; fillLight.position.set(m.fill[2], m.fill[3], m.fill[4]);
-  rimLight.color.setHex(m.rim[0]); rimLight.intensity = m.rim[1]; rimLight.position.set(m.rim[2], m.rim[3], m.rim[4]);
-  renderer.toneMappingExposure = m.exposure;
-  markDirty();
-  log(`lighting=${m.label}`);
-}
-function toggleLighting() {
-  lightingIndex = (lightingIndex + 1) % lightingModes.length;
-  applyLighting();
-  showModePopup(`Light ${lightingIndex + 1}/${lightingModes.length}: ${lightingModes[lightingIndex].label}`);
-}
-function applyBackground() {
-  const b = backgroundModes[backgroundIndex];
-  root.style.background = b.mid;
-  renderer.setClearColor(new THREE.Color(b.mid), 1);
-  if (!hdriBackgroundEnabled) scene.background = new THREE.Color(b.mid);
-  markDirty();
-  log(`background=${b.label}`);
-}
-function toggleBackground() {
-  backgroundIndex = (backgroundIndex + 1) % backgroundModes.length;
-  applyBackground();
-  showModePopup(`BG ${backgroundIndex + 1}/${backgroundModes.length}: ${backgroundModes[backgroundIndex].label}`);
-}
-async function applyHdri(show = true) {
-  const serial = ++hdriLoadSerial;
-  const opt = HDRI_OPTIONS[hdriIndex] || HDRI_OPTIONS[0];
-  if (!opt.url) {
-    scene.environment = null;
-    const b = backgroundModes[backgroundIndex];
-    scene.background = new THREE.Color(b.mid);
-    markDirty();
-    log(`hdri=${opt.label} none bg=${hdriBackgroundEnabled ? 'wanted' : 'off'}`);
-    if (show) showModePopup(`HDRI ${hdriIndex + 1}/${HDRI_OPTIONS.length}: ${opt.label}`);
-    return;
-  }
-  if (show) showModePopup(`HDRI ${hdriIndex + 1}/${HDRI_OPTIONS.length}: loading ${opt.label}`);
-  const started = performance.now();
-  try {
-    if (!hdriCache.has(opt.url)) {
-      const texture = await hdrLoader.loadAsync(opt.url);
-      if (serial !== hdriLoadSerial) { texture.dispose(); return; }
-      texture.mapping = THREE.EquirectangularReflectionMapping;
-      const envMap = pmremGenerator.fromEquirectangular(texture).texture;
-      envMap.userData = { label: opt.label, fixedWorld: true };
-      texture.dispose();
-      hdriCache.set(opt.url, envMap);
-      log(`hdri loaded ${opt.label} ms=${Math.round(performance.now() - started)} fixedWorld=true`);
-    } else {
-      log(`hdri cached ${opt.label}`);
-    }
-    const envMap = hdriCache.get(opt.url);
-    scene.environment = envMap;
-    if (hdriBackgroundEnabled) scene.background = envMap;
-    else {
-      const b = backgroundModes[backgroundIndex];
-      scene.background = new THREE.Color(b.mid);
-    }
-    markDirty();
-    if (show) showModePopup(`HDRI ${hdriIndex + 1}/${HDRI_OPTIONS.length}: ${opt.label}`);
-  } catch (err) {
-    console.error(err);
-    log(`hdri failed ${opt.label}: ${err}`);
-    if (show) showModePopup(`HDRI failed: ${opt.label}`);
-  }
-}
-function toggleHdri() {
-  hdriIndex = (hdriIndex + 1) % HDRI_OPTIONS.length;
-  applyHdri(true);
-}
-function toggleHdriBackground() {
-  hdriBackgroundEnabled = !hdriBackgroundEnabled;
-  const opt = HDRI_OPTIONS[hdriIndex] || HDRI_OPTIONS[0];
-  if (!hdriBackgroundEnabled) {
-    const b = backgroundModes[backgroundIndex];
-    scene.background = new THREE.Color(b.mid);
-    markDirty();
-    log('hdri background=flat');
-    showModePopup('Background: flat');
-    return;
-  }
-  if (!opt.url) {
-    const b = backgroundModes[backgroundIndex];
-    scene.background = new THREE.Color(b.mid);
-    markDirty();
-    log('hdri background requested but active hdri is none');
-    showModePopup('Background: no active HDRI');
-    return;
-  }
-  if (hdriCache.has(opt.url)) {
-    scene.background = hdriCache.get(opt.url);
-    markDirty();
-    log(`hdri background=${opt.label}`);
-    showModePopup(`Background: ${opt.label} HDRI`);
-    return;
-  }
-  showModePopup(`Background: loading ${opt.label}`);
-  applyHdri(false).then(() => {
-    const ready = hdriBackgroundEnabled && hdriCache.has(opt.url);
-    if (ready) {
-      scene.background = hdriCache.get(opt.url);
-      markDirty();
-      showModePopup(`Background: ${opt.label} HDRI`);
-    }
-  });
-}
-applyLighting();
-applyBackground();
-applyHdri(false);
-
-function activeLoader() {
-  if (MODEL_KIND === 'fbx') return new FBXLoader();
-  return new GLTFLoader();
-}
-function loadedRoot(loaded) {
-  return MODEL_KIND === 'fbx' ? loaded : loaded.scene;
-}
-activeLoader().load(MODEL_URL, (loaded) => {
-  model = loadedRoot(loaded);
-  scene.add(model);
-  refreshBounds();
-  frameModel(false);
-  const meshes = meshList();
-  let materialCount = 0;
-  let textureCount = 0;
-  const seenTextures = new Set();
-  for (const mesh of meshes) {
-    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-    materialCount += mats.filter(Boolean).length;
-    for (const mat of mats) {
-      if (!mat) continue;
-      for (const value of Object.values(mat)) {
-        if (value?.isTexture && !seenTextures.has(value.uuid)) { seenTextures.add(value.uuid); textureCount += 1; }
-      }
-    }
-  }
-  log(`model loaded kind=${MODEL_KIND} meshes=${meshes.length} materials=${materialCount} textures=${textureCount} ${rendererMemoryText()}`);
-  setStatus('Loaded. Orbit LMB, smooth zoom MMB drag/wheel, pan RMB.', true, 2400);
-}, undefined, (err) => {
-  console.error(err);
-  log(`model load failed kind=${MODEL_KIND}: ${err}`);
-  setStatus('Model failed to load.');
-});
-
-function animate(now = performance.now()) {
-  animationHandle = 0;
-  const rawDt = Math.max(0.0, now - lastRenderTime);
-  const dt = Math.min(0.05, Math.max(0.0, rawDt / 1000));
-  lastRenderTime = now;
-  frameStatsFrames += 1;
-  frameStatsMaxDt = Math.max(frameStatsMaxDt, rawDt);
-  const isSpike = rawDt > 35 && !document.hidden;
-  if (isSpike) {
-    frameStatsSpikeCount += 1;
-    if ((now - lastSpikeLogAt) > 900) {
-      lastSpikeLogAt = now;
-      const info = renderer.info.render;
-      log(`frame spike dt_ms=${Math.round(rawDt)} focused=${windowFocused} hidden=${document.hidden} wire=${wireMode} calls=${info.calls} tris=${info.triangles} pr=${renderer.getPixelRatio().toFixed(2)} dpr=${(window.devicePixelRatio || 1).toFixed(2)} mode=${renderModeLabel}`);
-    }
-  }
-  if (frameStatsLastHidden !== document.hidden || (now - frameStatsLastLogAt) > 10000) {
-    const elapsed = Math.max(1, now - frameStatsWindowStart);
-    const logElapsed = Math.max(1, now - frameStatsLastLogAt);
-    const info = renderer.info.render;
-    const avgRenderMs = renderStatsFrames ? (renderStatsTotalMs / renderStatsFrames) : 0;
-    log(`frame stats fps=${Math.round(frameStatsFrames * 1000 / logElapsed)} max_dt_ms=${Math.round(frameStatsMaxDt)} spikes=${frameStatsSpikeCount} render_ms_avg=${avgRenderMs.toFixed(2)} render_ms_max=${renderStatsMaxMs.toFixed(2)} focused=${windowFocused} hidden=${document.hidden} wire=${wireMode} calls=${info.calls} tris=${info.triangles} pr=${renderer.getPixelRatio().toFixed(2)} mode=${renderModeLabel} elapsed_s=${Math.round(elapsed / 1000)} frames=${renderedFramesTotal} ${rendererMemoryText()}`);
-    frameStatsLastLogAt = now;
-    frameStatsFrames = 0;
-    frameStatsMaxDt = 0;
-    frameStatsSpikeCount = 0;
-    renderStatsTotalMs = 0;
-    renderStatsMaxMs = 0;
-    renderStatsFrames = 0;
-    frameStatsLastHidden = document.hidden;
-  }
-  const pulseChanged = renderPaused ? false : updateFramePulse(now);
-  const rotating = !renderPaused && autoRotate && model && !document.hidden && !controlsDragging && now >= autoRotatePauseUntil;
-  if (rotating) { model.rotation.y = (model.rotation.y + dt * 0.42) % (Math.PI * 2); markDirty(); }
-  const controlsChanged = renderPaused ? false : controls.update(dt);
-  const shouldRender = !renderPaused && (modelDirty || controlsChanged || rotating || pulseChanged);
-  if (shouldRender) {
-    normalizeRotationY(model);
-    renderer.info.reset();
-    const renderStarted = performance.now();
-    renderer.render(scene, camera);
-    const renderMs = performance.now() - renderStarted;
-    renderStatsTotalMs += renderMs;
-    renderStatsMaxMs = Math.max(renderStatsMaxMs, renderMs);
-    renderStatsFrames += 1;
-    renderedFramesTotal += 1;
-    modelDirty = false;
-  }
-  if (diagnosticsVisible) {
-    const info = renderer.info.render;
-    const recentFps = Math.round(frameStatsFrames * 1000 / Math.max(250, now - frameStatsLastLogAt));
-    diagnostics.textContent =
-      `fps ${recentFps}  maxdt ${Math.round(frameStatsMaxDt)}ms  spikes ${frameStatsSpikeCount}
-` +
-      `focused ${windowFocused}  hidden ${document.hidden}  wire ${wireMode}  auto ${autoRotate}  paused ${renderPaused}
-` +
-      `mode ${renderModeLabel}  dirty ${modelDirty}  calls ${info.calls}  tris ${info.triangles}  lines ${info.lines}
-` +
-      `render avg ${renderStatsFrames ? (renderStatsTotalMs / renderStatsFrames).toFixed(2) : '0.00'}ms max ${renderStatsMaxMs.toFixed(2)}ms  frames ${renderedFramesTotal}
-` +
-      `${rendererMemoryText()}  pr ${renderer.getPixelRatio().toFixed(2)}  quality ${qualityModes[qualityIndex].label}  dpr ${(window.devicePixelRatio || 1).toFixed(2)}  size ${window.innerWidth}x${window.innerHeight}`;
-  }
-  const waitingForAutoRotate = autoRotate && model && !document.hidden && !controlsDragging && now < autoRotatePauseUntil;
-  const wantsContinuous = !renderPaused && (
-    rotating || controlsDragging || middleZooming || framePulse || diagnosticsVisible || controlsChanged
-  );
-  if (wantsContinuous) scheduleFrame();
-  else if (waitingForAutoRotate) scheduleDelayedFrame(autoRotatePauseUntil - now);
-}
-scheduleFrame();
-window.addEventListener('focus', () => { windowFocused = true; });
-window.addEventListener('blur', () => { windowFocused = false; });
-document.addEventListener('visibilitychange', () => { markDirty(); log(`visibility hidden=${document.hidden}`); });
-window.addEventListener('resize', () => {
-  camera.aspect = window.innerWidth / window.innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
-  markDirty();
-});
-document.addEventListener('keydown', (e) => {
-  if ((e.ctrlKey || e.metaKey) && (e.key === 'b' || e.key === 'B')) { e.preventDefault(); toggleHdriBackground(); return; }
-  if (e.key === 'r' || e.key === 'R') resetCamera();
-  if (e.key === 'f' || e.key === 'F') frameModel(true);
-  if (e.key === 'a' || e.key === 'A') toggleAutoRotate();
-  if (e.key === 'w' || e.key === 'W') toggleWire();
-  if (e.key === 'x' || e.key === 'X') toggleWireXray();
-  if (e.key === 'c' || e.key === 'C') toggleClay();
-  if (e.key === 'l' || e.key === 'L') toggleLighting();
-  if (e.key === 'h' || e.key === 'H') toggleHdri();
-  if (e.key === 'b' || e.key === 'B') toggleBackground();
-  if (e.key === 'd' || e.key === 'D') { diagnosticsVisible = !diagnosticsVisible; diagnostics.style.display = diagnosticsVisible ? 'block' : 'none'; markDirty(); log(`diagnostics=${diagnosticsVisible}`); }
-  if (e.key === 'q' || e.key === 'Q') toggleQuality();
-  if (e.key === 'p' || e.key === 'P') { renderPaused = !renderPaused; if (!renderPaused) markDirty(); log(`renderPaused=${renderPaused}`); showModePopup(`WebGL ${renderPaused ? 'paused' : 'running'}`); }
-});
-window.viewerResetCamera = resetCamera;
-window.viewerFrameModel = () => frameModel(true);
-window.viewerToggleAutoRotate = toggleAutoRotate;
-window.viewerToggleWire = toggleWire;
-window.viewerToggleWireXray = toggleWireXray;
-window.viewerToggleClay = toggleClay;
-window.viewerToggleLighting = toggleLighting;
-window.viewerToggleHdri = toggleHdri;
-window.viewerToggleHdriBackground = toggleHdriBackground;
-window.viewerToggleBackground = toggleBackground;
-window.viewerToggleDiagnostics = () => { diagnosticsVisible = !diagnosticsVisible; diagnostics.style.display = diagnosticsVisible ? 'block' : 'none'; markDirty(); log(`diagnostics=${diagnosticsVisible}`); };
-window.viewerToggleQuality = toggleQuality;
-window.viewerToggleRenderPause = () => { renderPaused = !renderPaused; if (!renderPaused) markDirty(); log(`renderPaused=${renderPaused}`); showModePopup(`WebGL ${renderPaused ? 'paused' : 'running'}`); };
-</script>
-</body>
-</html>'''
+    initial_view_state_json = json.dumps(initial_view_state or None, ensure_ascii=False)
+    template = VIEWER_TEMPLATE_PATH.read_text(encoding="utf-8")
     return (
         template.replace("__ACCENT__", ACCENT)
         .replace("__TITLE__", title)
@@ -986,6 +414,7 @@ window.viewerToggleRenderPause = () => { renderPaused = !renderPaused; if (!rend
         .replace("__MODEL_URL__", model_url_json)
         .replace("__MODEL_KIND__", model_kind_json)
         .replace("__HDRI_OPTIONS__", hdri_json)
+        .replace("__INITIAL_VIEW_STATE__", initial_view_state_json)
     )
 
 
@@ -1003,6 +432,11 @@ class ViewerWindow(QMainWindow):
         self._diag_last_cpu = time.process_time()
         self._diag_process_snapshot_index = 0
         self._topmost_enabled = True
+        self.preview_variants: list[dict] = []
+        self.preview_variant_index = -1
+        self.preview_variant_manifest: Path | None = None
+        self._pending_view_state: dict | None = None
+        self._last_view_state: dict | None = None
         self.setWindowTitle(f"3D Viewer - {display_path.name}")
         if ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(ICON_PATH)))
@@ -1030,13 +464,16 @@ class ViewerWindow(QMainWindow):
     def _load_served_model(self, served_model_path: Path, display_path: Path) -> None:
         self.model_path = display_path
         self.served_model_path = served_model_path
+        self._refresh_preview_variants(display_path)
         self.setWindowTitle(f"3D Viewer - {display_path.name}")
         model_rel = served_model_path.absolute().relative_to(self.server_root.resolve()).as_posix()
         model_url = "/" + quote(model_rel)
         model_kind = served_model_path.suffix.lower().lstrip(".")
         html_path = self._viewer_html_path()
         html_path.parent.mkdir(parents=True, exist_ok=True)
-        html_path.write_text(build_html(display_path.name, model_url, display_path, model_kind), encoding="utf-8")
+        initial_view_state = self._pending_view_state
+        self._pending_view_state = None
+        html_path.write_text(build_html(display_path.name, model_url, display_path, model_kind, initial_view_state), encoding="utf-8")
         self.view.load(self._viewer_url())
 
     def open_model_dialog(self) -> None:
@@ -1053,6 +490,7 @@ class ViewerWindow(QMainWindow):
     def open_model_path(self, model_path: Path) -> None:
         try:
             model_path = model_path.expanduser().resolve()
+            save_window_state(self)
             resolved_model = resolve_model_input(model_path, self.runtime_root)
             served_model = prepare_served_model(resolved_model, self.runtime_root)
             save_last_model(model_path)
@@ -1060,6 +498,60 @@ class ViewerWindow(QMainWindow):
             self._load_served_model(served_model, model_path)
         except Exception as exc:
             log_line(f"open model failed model={model_path}: {exc}")
+
+    def _refresh_preview_variants(self, display_path: Path) -> None:
+        self.preview_variants, self.preview_variant_index, self.preview_variant_manifest = load_preview_variants(display_path)
+        if self.preview_variants:
+            labels = ", ".join(v["label"] for v in self.preview_variants)
+            log_line(
+                f"avatar variants count={len(self.preview_variants)} index={self.preview_variant_index + 1} "
+                f"manifest={self.preview_variant_manifest} labels={labels}"
+            )
+
+    def show_viewer_popup(self, text: str) -> None:
+        payload = json.dumps(text)
+        self.view.page().runJavaScript(f"window.viewerShowModePopup && window.viewerShowModePopup({payload});")
+
+    def swap_avatar_variant(self) -> None:
+        if len(self.preview_variants) < 2:
+            log_line(f"avatar variant swap unavailable model={self.model_path}")
+            self.show_viewer_popup("No avatar variants")
+            return
+        next_index = (self.preview_variant_index + 1) % len(self.preview_variants)
+        variant = self.preview_variants[next_index]
+        label = variant["label"]
+        path = variant["path"]
+        log_line(f"avatar variant swap {self.preview_variant_index + 1}->{next_index + 1} label={label} path={path}")
+
+        def open_with_state(state_text=None, label=label, path=path):
+            parsed_state = None
+            if isinstance(state_text, str) and state_text.strip():
+                try:
+                    parsed = json.loads(state_text)
+                    if isinstance(parsed, dict):
+                        parsed_state = parsed
+                except Exception as exc:
+                    log_line(f"avatar variant view state parse failed label={label}: {exc}")
+            elif isinstance(state_text, dict):
+                parsed_state = state_text
+
+            if isinstance(parsed_state, dict):
+                self._pending_view_state = parsed_state
+                self._last_view_state = parsed_state
+                log_line(f"avatar variant preserving view state label={label} keys={','.join(sorted(parsed_state.keys()))}")
+            elif isinstance(self._last_view_state, dict):
+                self._pending_view_state = self._last_view_state
+                log_line(f"avatar variant using last view state label={label} state_type={type(state_text).__name__}")
+            else:
+                self._pending_view_state = None
+                log_line(f"avatar variant no view state label={label} state_type={type(state_text).__name__}")
+            self.open_model_path(path)
+            QTimer.singleShot(350, lambda label=label: self.show_viewer_popup(f"Avatar: {label}"))
+
+        self.view.page().runJavaScript(
+            "window.viewerSnapshotStateJson ? window.viewerSnapshotStateJson() : '';",
+            open_with_state,
+        )
 
     def _log_qt_diagnostics(self) -> None:
         now = time.perf_counter()
@@ -1069,6 +561,10 @@ class ViewerWindow(QMainWindow):
         self._diag_last_wall = now
         self._diag_last_cpu = cpu
         rect = self.geometry()
+        try:
+            screen_text = monitor_label(self.windowHandle().screen() if self.windowHandle() else self.screen())
+        except Exception:
+            screen_text = "unknown"
         hwnd = int(self.winId()) if os.name == "nt" else 0
         foreground = False
         topmost = False
@@ -1086,7 +582,7 @@ class ViewerWindow(QMainWindow):
             "qt stats "
             f"active={self.isActiveWindow()} visible={self.isVisible()} minimized={self.isMinimized()} "
             f"foreground={foreground} topmost={topmost} cpu_pct={cpu_pct:.1f} "
-            f"rect={rect.x()},{rect.y()},{rect.width()}x{rect.height()}"
+            f"rect={rect.x()},{rect.y()},{rect.width()}x{rect.height()} screen={screen_text}"
         )
 
     def log_process_snapshot(self) -> None:
@@ -1125,8 +621,15 @@ class ViewerWindow(QMainWindow):
 
     def _add_shortcuts(self) -> None:
         actions = [
-            ("Reset Camera", "R", lambda: self.view.page().runJavaScript("window.viewerResetCamera && window.viewerResetCamera();")),
+            ("Toggle Root Motion", "R", lambda: self.view.page().runJavaScript("window.viewerToggleRootMotion && window.viewerToggleRootMotion();")),
             ("Frame Model", "F", lambda: self.view.page().runJavaScript("window.viewerFrameModel && window.viewerFrameModel();")),
+            ("Play/Pause Animation", "Space", lambda: self.view.page().runJavaScript("window.viewerToggleAnimationPlayback && window.viewerToggleAnimationPlayback();")),
+            ("Previous Animation Clip", "[", lambda: self.view.page().runJavaScript("window.viewerPreviousAnimationClip && window.viewerPreviousAnimationClip();")),
+            ("Next Animation Clip", "]", lambda: self.view.page().runJavaScript("window.viewerNextAnimationClip && window.viewerNextAnimationClip();")),
+            ("Restart Animation", "0", lambda: self.view.page().runJavaScript("window.viewerRestartAnimation && window.viewerRestartAnimation();")),
+            ("Swap Avatar", "M", self.swap_avatar_variant),
+            ("Animation Faster", "+", lambda: self.view.page().runJavaScript("window.viewerAnimationFaster && window.viewerAnimationFaster();")),
+            ("Animation Slower", "-", lambda: self.view.page().runJavaScript("window.viewerAnimationSlower && window.viewerAnimationSlower();")),
             ("Toggle Auto-Rotate", "A", lambda: self.view.page().runJavaScript("window.viewerToggleAutoRotate && window.viewerToggleAutoRotate();")),
             ("Toggle Wire", "W", lambda: self.view.page().runJavaScript("window.viewerToggleWire && window.viewerToggleWire();")),
             ("Toggle Wire Xray", "X", lambda: self.view.page().runJavaScript("window.viewerToggleWireXray && window.viewerToggleWireXray();")),
@@ -1332,7 +835,9 @@ def resolve_model_input(model_path: Path, runtime_root: Path) -> Path:
 
 
 def start_server(root: Path) -> tuple[ThreadingHTTPServer, int]:
-    handler = lambda *args, **kwargs: QuietHandler(*args, directory=str(root), **kwargs)
+    def handler(*args, **kwargs):
+        return QuietHandler(*args, directory=str(root), **kwargs)
+
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     port = int(server.server_address[1])
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1347,6 +852,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=1500)
     parser.add_argument("--height", type=int, default=900)
     parser.add_argument("--reset-position", action="store_true", help="Ignore saved viewer window geometry for this launch.")
+    parser.add_argument("--monitor", choices=["right", "primary", "fast"], default="right", help="Initial monitor: right keeps the normal side-display workflow; fast chooses the highest-refresh display.")
     return parser.parse_args()
 
 
@@ -1400,10 +906,8 @@ def main() -> int:
     window = ViewerWindow(served_model, model_path, server_root, port)
     restored = False if args.reset_position else restore_window_state(window)
     if not restored:
-        place_on_right_monitor(window, args.width, args.height)
+        place_on_monitor(window, args.width, args.height, args.monitor)
     window.show()
-    if not restored:
-        QTimer.singleShot(60, lambda: place_on_right_monitor_physical(window))
     QTimer.singleShot(100, lambda: window.apply_topmost(True))
     QTimer.singleShot(120, window.raise_)
     exit_code = app.exec()
