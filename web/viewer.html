@@ -1,0 +1,1108 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script type="importmap">
+{"imports":{"three":"/vendor/three/build/three.module.js","three/addons/":"/vendor/three/examples/jsm/"}}
+</script>
+<style>
+html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #050608; color: #e8e8ee; font-family: Segoe UI, system-ui, sans-serif; }
+#bar { position: fixed; top: 0; left: 0; right: 0; height: 48px; display: flex; align-items: center; gap: 18px; padding: 0 18px; background: rgba(8,10,14,.92); border-bottom: 1px solid rgba(227,0,140,.42); z-index: 2; -webkit-font-smoothing: antialiased; text-rendering: geometricPrecision; }
+#title { color: __ACCENT__; font-weight: 900; font-size: 21px; white-space: nowrap; letter-spacing: .1px; }
+#path { opacity: .9; font-size: 16px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#keys { margin-left: auto; opacity: .9; font-size: 14px; font-weight: 700; white-space: nowrap; }
+#viewer { position: fixed; inset: 0; background: #101722; }
+#status { position: fixed; left: 14px; bottom: 12px; padding: 7px 10px; background: rgba(8,10,14,.78); border: 1px solid rgba(255,255,255,.12); border-radius: 8px; color: #f0f0f4; font-size: 14px; font-weight: 700; z-index: 3; opacity: 1; transition: opacity .22s ease; text-shadow: 0 1px 2px #000; pointer-events: none; }
+#modePopup { position: fixed; left: 14px; top: 56px; padding: 7px 10px; background: rgba(8,10,14,.82); border: 1px solid rgba(227,0,140,.36); border-radius: 8px; color: #fff; font-size: 14px; font-weight: 800; z-index: 4; opacity: 0; transform: translateY(-4px); transition: opacity .16s ease, transform .16s ease; text-shadow: 0 1px 2px #000; pointer-events: none; }
+#modePopup.show { opacity: 1; transform: translateY(0); }
+#diagnostics { position: fixed; right: 12px; bottom: 12px; min-width: 270px; padding: 9px 11px; background: rgba(4,5,7,.82); border: 1px solid rgba(227,0,140,.36); border-radius: 9px; color: #f4f4f8; font: 700 12px/1.35 Consolas, monospace; white-space: pre; z-index: 5; pointer-events: none; display: none; }
+#animHud { position: fixed; left: 14px; bottom: 52px; max-width: min(760px, calc(100vw - 28px)); padding: 7px 10px; background: rgba(8,10,14,.82); border: 1px solid rgba(227,0,140,.34); border-radius: 8px; color: #f7f3f8; font-size: 14px; font-weight: 800; z-index: 3; display: none; text-shadow: 0 1px 2px #000; pointer-events: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+</style>
+</head>
+<body>
+<div id="viewer"></div>
+<div id="bar"><div id="title">__TITLE__</div><div id="path">__PATH__</div><div id="keys">LMB orbit | MMB zoom | RMB pan | Space anim | [ ] clips | 0 restart | R root | M avatar | +/- speed | F frame | A auto | W wire | X xray | C clay | H HDRI | L light | B bg</div></div>
+<div id="status">Loading model...</div>
+<div id="animHud"></div>
+<div id="modePopup"></div>
+<div id="diagnostics"></div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
+import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
+
+const MODEL_URL = __MODEL_URL__;
+const MODEL_KIND = __MODEL_KIND__;
+const HDRI_OPTIONS = __HDRI_OPTIONS__;
+const INITIAL_VIEW_STATE = __INITIAL_VIEW_STATE__;
+const root = document.getElementById('viewer');
+const status = document.getElementById('status');
+const modePopup = document.getElementById('modePopup');
+const diagnostics = document.getElementById('diagnostics');
+const animHud = document.getElementById('animHud');
+let statusFadeTimer = 0;
+let popupTimer = 0;
+let diagnosticsVisible = false;
+let renderPaused = false;
+function log(text) { console.log(`[viewer] ${text}`); }
+function setStatus(text, fade = false, fadeMs = 1000) {
+  status.style.opacity = '1';
+  status.textContent = text;
+  clearTimeout(statusFadeTimer);
+  if (fade) statusFadeTimer = setTimeout(() => { status.style.opacity = '0'; }, fadeMs);
+}
+function showModePopup(text) {
+  modePopup.textContent = text;
+  modePopup.classList.add('show');
+  clearTimeout(popupTimer);
+  popupTimer = setTimeout(() => modePopup.classList.remove('show'), 1150);
+}
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(32, window.innerWidth / window.innerHeight, 0.01, 10000);
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, premultipliedAlpha: false, powerPreference: 'high-performance' });
+renderer.setPixelRatio(1.0);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+renderer.setClearColor(0x101722, 1);
+renderer.info.autoReset = false;
+root.appendChild(renderer.domElement);
+const qualityModes = [
+  { label: 'performance', pixelRatio: 1.0 },
+  { label: 'balanced', pixelRatio: 1.25 },
+  { label: 'sharp', pixelRatio: 1.5 }
+];
+let qualityIndex = 0;
+function applyQuality(show = true) {
+  const q = qualityModes[qualityIndex];
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, q.pixelRatio));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  markDirty();
+  log(`quality=${q.label} pr=${renderer.getPixelRatio().toFixed(2)}`);
+  if (show) showModePopup(`Quality ${qualityIndex + 1}/${qualityModes.length}: ${q.label}`);
+}
+function toggleQuality() {
+  qualityIndex = (qualityIndex + 1) % qualityModes.length;
+  applyQuality(true);
+}
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.screenSpacePanning = true;
+controls.mouseButtons = {
+  LEFT: THREE.MOUSE.ROTATE,
+  MIDDLE: -1,
+  RIGHT: THREE.MOUSE.PAN
+};
+let controlsDragging = false;
+let middleZooming = false;
+let middleZoomPointerId = null;
+let middleZoomY = 0;
+function applyMiddleDragZoom(clientY) {
+  const dy = clientY - middleZoomY;
+  if (Math.abs(dy) < 0.25) return;
+  middleZoomY = clientY;
+  const offset = camera.position.clone().sub(controls.target);
+  const oldDistance = Math.max(0.0001, offset.length());
+  const scale = Math.exp(dy * 0.006 * controls.zoomSpeed);
+  const newDistance = THREE.MathUtils.clamp(oldDistance * scale, controls.minDistance, controls.maxDistance);
+  camera.position.copy(controls.target).add(offset.normalize().multiplyScalar(newDistance));
+  camera.updateMatrixWorld();
+  controls.update(0);
+  markDirty();
+}
+renderer.domElement.addEventListener('pointerdown', (event) => {
+  if (event.button !== 1) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  middleZooming = true;
+  middleZoomPointerId = event.pointerId;
+  middleZoomY = event.clientY;
+  controlsDragging = true;
+  renderer.domElement.setPointerCapture?.(event.pointerId);
+}, { passive: false, capture: true });
+renderer.domElement.addEventListener('pointermove', (event) => {
+  if (!middleZooming || event.pointerId !== middleZoomPointerId) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  applyMiddleDragZoom(event.clientY);
+}, { passive: false, capture: true });
+function endMiddleZoom(event) {
+  if (!middleZooming || event.pointerId !== middleZoomPointerId) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  middleZooming = false;
+  middleZoomPointerId = null;
+  controlsDragging = false;
+  renderer.domElement.releasePointerCapture?.(event.pointerId);
+  markDirty();
+}
+renderer.domElement.addEventListener('pointerup', endMiddleZoom, { passive: false, capture: true });
+renderer.domElement.addEventListener('pointercancel', endMiddleZoom, { passive: false, capture: true });
+renderer.domElement.addEventListener('auxclick', (event) => {
+  if (event.button === 1) { event.preventDefault(); event.stopImmediatePropagation(); }
+}, { passive: false, capture: true });
+controls.addEventListener('start', () => { controlsDragging = true; markDirty(); });
+controls.addEventListener('end', () => { controlsDragging = false; markDirty(); });
+controls.zoomSpeed = 1.1;
+log('mouse controls: left rotate, middle drag custom smooth zoom, wheel zoom, right pan');
+
+const hemiLight = new THREE.HemisphereLight(0xffffff, 0x2a3140, 1.3);
+scene.add(hemiLight);
+const keyLight = new THREE.DirectionalLight(0xffffff, 2.15);
+keyLight.position.set(2.8, 4.5, 3.5);
+scene.add(keyLight);
+const fillLight = new THREE.DirectionalLight(0xdde8ff, 0.4);
+fillLight.position.set(-3, 1.5, 2);
+scene.add(fillLight);
+const rimLight = new THREE.DirectionalLight(0xffd6f0, 0.85);
+rimLight.position.set(-4, 2, -3);
+scene.add(rimLight);
+
+let model = null;
+let skeletonHelper = null;
+let animationMixer = null;
+let animationClips = [];
+let activeClipIndex = -1;
+let activeAction = null;
+let animationPlaying = false;
+let animationDuration = 0;
+let animationSpeed = 1.0;
+let rootMotionEnabled = true;
+let rootMotionTarget = null;
+let rootMotionStartLocal = null;
+let rootMotionBaseModelPosition = null;
+let rootMotionBaseModelQuaternion = null;
+let rootMotionHomePosition = null;
+let rootMotionHomeQuaternion = null;
+let rootMotionLastActionTime = -1;
+let rootMotionTargetLabel = 'auto';
+const animationSpeedLevels = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+let animationSpeedIndex = 3;
+let bounds = new THREE.Box3();
+let center = new THREE.Vector3();
+let size = new THREE.Vector3();
+let radius = 1;
+let frameIndex = 0;
+let lastFrameTap = 0;
+let autoRotate = true;
+let autoRotatePauseUntil = 0;
+let framePulse = null;
+let wireMode = 0;
+let wireXray = false;
+let clayEnabled = false;
+let modelDirty = true;
+let lastRenderTime = performance.now();
+let windowFocused = true;
+let frameStatsWindowStart = performance.now();
+let frameStatsFrames = 0;
+let frameStatsMaxDt = 0;
+let frameStatsSpikeCount = 0;
+let frameStatsLastHidden = false;
+let lastSpikeLogAt = 0;
+let renderStatsTotalMs = 0;
+let renderStatsMaxMs = 0;
+let renderStatsFrames = 0;
+let renderedFramesTotal = 0;
+let frameStatsLastLogAt = performance.now();
+let animationHandle = 0;
+let delayedFrameTimer = 0;
+const renderModeLabel = 'continuous';
+const wireCache = new Map();
+let wireOverlays = [];
+let lightingIndex = 0;
+let backgroundIndex = 0;
+let hdriIndex = 0;
+let hdriLoadSerial = 0;
+let hdriBackgroundEnabled = false;
+const hdriCache = new Map();
+const hdrLoader = new HDRLoader();
+const pmremGenerator = new THREE.PMREMGenerator(renderer);
+pmremGenerator.compileEquirectangularShader();
+const frameResetMs = 3600;
+const backgroundModes = [
+  { label: 'cool slate', inner: '#27303e', mid: '#101722', outer: '#05070b' },
+  { label: 'light grey', inner: '#6b7078', mid: '#9aa0a8', outer: '#d3d5d8' },
+  { label: 'very light grey', inner: '#9fa4aa', mid: '#d4d6d9', outer: '#f2f2f1' },
+  { label: 'warm amber', inner: '#765135', mid: '#3a2418', outer: '#140c07' },
+  { label: 'green teal', inner: '#347365', mid: '#1b4841', outer: '#09201d' },
+  { label: 'violet dusk', inner: '#7450a0', mid: '#39214f', outer: '#16091f' }
+];
+const lightingModes = [
+  { label: 'studio', hemi: [0xffffff, 0x2a3140, 1.3], key: [0xffffff, 2.15, 2.8, 4.5, 3.5], fill: [0xdde8ff, .4, -3, 1.5, 2], rim: [0xffd6f0, .85, -4, 2, -3], exposure: 1.05 },
+  { label: 'flat inspect', hemi: [0xffffff, 0xffffff, 2.4], key: [0xffffff, .55, 0, 3, 4], fill: [0xffffff, .5, -3, 2, 2], rim: [0xffffff, .15, 0, 2, -4], exposure: .95 },
+  { label: 'hard forms', hemi: [0xb8caff, 0x151923, .45], key: [0xffffff, 3.4, 4, 5, 2], fill: [0x405080, .08, -4, 1, 1], rim: [0xffffff, .4, -3, 3, -4], exposure: 1.0 },
+  { label: 'rim silhouette', hemi: [0x657080, 0x07080a, .25], key: [0x7aa4ff, .75, 0, 2, 5], fill: [0x22304a, .1, 3, 1, 2], rim: [0xff2f9f, 3.1, -4, 2, -3], exposure: 1.05 },
+  { label: 'warm material', hemi: [0xffe7c8, 0x2b1b12, .9], key: [0xffcf95, 2.5, 3.2, 3.5, 4], fill: [0x6aa0ff, .3, -4, 1.3, 2], rim: [0xffffff, .55, -2, 2, -4], exposure: 1.0 },
+  { label: 'low dramatic', hemi: [0x8890a0, 0x060608, .18], key: [0xffffff, 2.9, -1, .6, 3.6], fill: [0x26305c, .05, 3, 1, 1], rim: [0xff2a65, 1.4, 4, 1.2, -3], exposure: 1.08 }
+];
+const originalMaterials = new Map();
+const clayMaterial = new THREE.MeshStandardMaterial({ color: 0xb8b3aa, roughness: 0.92, metalness: 0.0 });
+
+const frameAngles = [
+  { label: 'front', yaw: 0, pitch: 72 },
+  { label: 'front 3/4 right', yaw: 35, pitch: 72 },
+  { label: 'front 3/4 left', yaw: -35, pitch: 72 },
+  { label: 'right side', yaw: 90, pitch: 72 },
+  { label: 'left side', yaw: -90, pitch: 72 },
+  { label: 'back 3/4 right', yaw: 145, pitch: 72 },
+  { label: 'back 3/4 left', yaw: -145, pitch: 72 },
+  { label: 'back', yaw: 180, pitch: 72 },
+  { label: 'high front', yaw: 25, pitch: 48 },
+  { label: 'top', yaw: 0, pitch: 8 },
+  { label: 'bottom', yaw: 0, pitch: 166 }
+];
+
+function meshList() {
+  const out = [];
+  if (!model) return out;
+  model.traverse((obj) => {
+    if (obj.userData?.viewerWireOverlay) return;
+    if (obj.isMesh && obj.geometry?.getAttribute('position')) out.push(obj);
+  });
+  return out;
+}
+function boneList() {
+  const out = [];
+  if (!model) return out;
+  model.traverse((obj) => { if (obj.isBone) out.push(obj); });
+  return out;
+}
+function boneBounds() {
+  const bones = boneList();
+  if (!bones.length) return null;
+  const box = new THREE.Box3();
+  const point = new THREE.Vector3();
+  for (const bone of bones) {
+    bone.getWorldPosition(point);
+    box.expandByPoint(point);
+  }
+  return box;
+}
+function refreshBounds() {
+  bounds.setFromObject(model);
+  if (!Number.isFinite(bounds.min.x) || bounds.isEmpty()) {
+    const bonesBox = boneBounds();
+    if (bonesBox) bounds.copy(bonesBox);
+  }
+  bounds.getCenter(center);
+  bounds.getSize(size);
+  radius = Math.max(0.5, size.length() * 1.45);
+  controls.target.copy(center);
+  controls.minDistance = radius * 0.05;
+  controls.maxDistance = radius * 9;
+  camera.near = Math.max(0.001, radius / 500);
+  camera.far = radius * 80;
+  camera.updateProjectionMatrix();
+  log(`bounds size=${size.x.toFixed(3)},${size.y.toFixed(3)},${size.z.toFixed(3)} radius=${radius.toFixed(3)}`);
+}
+function positionForFrame(shot) {
+  const theta = THREE.MathUtils.degToRad(shot.yaw);
+  const phi = THREE.MathUtils.degToRad(shot.pitch);
+  const distance = radius;
+  return new THREE.Vector3(center.x + distance * Math.sin(phi) * Math.sin(theta), center.y + distance * Math.cos(phi), center.z + distance * Math.sin(phi) * Math.cos(theta));
+}
+function frameModel(manual = true) {
+  if (!model) return;
+  const now = performance.now();
+  if (!manual || (now - lastFrameTap) > frameResetMs) frameIndex = 0;
+  else frameIndex = (frameIndex + 1) % frameAngles.length;
+  lastFrameTap = now;
+  const shot = frameAngles[frameIndex];
+  camera.position.copy(positionForFrame(shot));
+  controls.target.copy(center);
+  controls.update();
+  if (manual) {
+    autoRotatePauseUntil = now + 2000;
+    startFramePulse();
+  }
+  markDirty();
+  setStatus(`Framed: ${shot.label}.`, true);
+}
+
+function startFramePulse() {
+  framePulse = {
+    start: performance.now(),
+    duration: 170,
+    baseFov: camera.fov,
+    amount: 1.25
+  };
+  markDirty();
+}
+function updateFramePulse(now) {
+  if (!framePulse) return false;
+  const t = Math.min(1, (now - framePulse.start) / framePulse.duration);
+  const easeOut = 1 - Math.pow(1 - t, 3.2);
+  camera.fov = framePulse.baseFov + framePulse.amount * (1 - easeOut);
+  camera.updateProjectionMatrix();
+  if (t >= 1) {
+    camera.fov = framePulse.baseFov;
+    camera.updateProjectionMatrix();
+    framePulse = null;
+  }
+  return true;
+}
+function resetCamera() { frameIndex = 0; lastFrameTap = 0; frameModel(false); }
+function toggleAutoRotate() { autoRotate = !autoRotate; markDirty(); setStatus(`Auto-rotate ${autoRotate ? 'on' : 'off'}.`, true); log(`autoRotate=${autoRotate}`); }
+function snapshotVector(v) { return { x: v.x, y: v.y, z: v.z }; }
+function readVectorState(v) {
+  if (!v || !Number.isFinite(v.x) || !Number.isFinite(v.y) || !Number.isFinite(v.z)) return null;
+  return new THREE.Vector3(v.x, v.y, v.z);
+}
+function snapshotViewerState() {
+  return {
+    camera: snapshotVector(camera.position),
+    target: snapshotVector(controls.target),
+    fov: camera.fov,
+    rootMotionEnabled,
+    activeClipIndex,
+    actionTime: activeAction ? activeAction.time : 0,
+    animationPlaying,
+    animationSpeedIndex,
+    autoRotate,
+    wireMode,
+    wireXray,
+    clayEnabled,
+    lightingIndex,
+    backgroundIndex,
+    hdriIndex,
+    hdriBackgroundEnabled,
+    qualityIndex,
+    diagnosticsVisible,
+    renderPaused
+  };
+}
+function snapshotViewerStateJson() {
+  try {
+    return JSON.stringify(snapshotViewerState());
+  } catch (err) {
+    log(`state snapshot failed: ${err}`);
+    return '';
+  }
+}
+function restoreViewerState(state) {
+  if (!state || typeof state !== 'object') return false;
+  const cameraPosition = readVectorState(state.camera);
+  const targetPosition = readVectorState(state.target);
+  if (Number.isFinite(state.qualityIndex)) {
+    qualityIndex = THREE.MathUtils.clamp(Math.round(state.qualityIndex), 0, qualityModes.length - 1);
+    applyQuality(false);
+  }
+  if (Number.isFinite(state.lightingIndex)) {
+    lightingIndex = THREE.MathUtils.clamp(Math.round(state.lightingIndex), 0, lightingModes.length - 1);
+    applyLighting();
+  }
+  if (Number.isFinite(state.backgroundIndex)) {
+    backgroundIndex = THREE.MathUtils.clamp(Math.round(state.backgroundIndex), 0, backgroundModes.length - 1);
+    applyBackground();
+  }
+  if (Number.isFinite(state.hdriIndex)) {
+    hdriIndex = THREE.MathUtils.clamp(Math.round(state.hdriIndex), 0, HDRI_OPTIONS.length - 1);
+  }
+  if (typeof state.hdriBackgroundEnabled === 'boolean') hdriBackgroundEnabled = state.hdriBackgroundEnabled;
+  applyHdri(false);
+  if (typeof state.autoRotate === 'boolean') autoRotate = state.autoRotate;
+  if (Number.isFinite(state.wireMode)) wireMode = THREE.MathUtils.clamp(Math.round(state.wireMode), 0, 1);
+  if (typeof state.wireXray === 'boolean') wireXray = state.wireXray;
+  if (typeof state.clayEnabled === 'boolean') clayEnabled = state.clayEnabled;
+  if (typeof state.diagnosticsVisible === 'boolean') {
+    diagnosticsVisible = state.diagnosticsVisible;
+    diagnostics.style.display = diagnosticsVisible ? 'block' : 'none';
+  }
+  if (typeof state.renderPaused === 'boolean') renderPaused = state.renderPaused;
+  if (Number.isFinite(state.animationSpeedIndex)) {
+    animationSpeedIndex = THREE.MathUtils.clamp(Math.round(state.animationSpeedIndex), 0, animationSpeedLevels.length - 1);
+    applyAnimationSpeed();
+  }
+  if (animationClips.length) {
+    const requestedClip = Number.isFinite(state.activeClipIndex) ? Math.round(state.activeClipIndex) : activeClipIndex;
+    playClip(requestedClip, true);
+    if (activeAction && Number.isFinite(state.actionTime)) {
+      const duration = Math.max(0.001, animationDuration || activeAction.getClip().duration || 0.001);
+      activeAction.time = THREE.MathUtils.clamp(state.actionTime, 0, duration);
+      if (animationMixer) animationMixer.update(0);
+    }
+    if (activeAction && typeof state.animationPlaying === 'boolean') {
+      activeAction.paused = !state.animationPlaying;
+      animationPlaying = state.animationPlaying;
+    }
+  }
+  if (typeof state.rootMotionEnabled === 'boolean') rootMotionEnabled = state.rootMotionEnabled;
+  resetRootMotionToOrigin(false);
+  resetRootMotionCompensation('restore');
+  applyClay();
+  rebuildWire();
+  if (cameraPosition && targetPosition) {
+    camera.position.copy(cameraPosition);
+    controls.target.copy(targetPosition);
+    if (Number.isFinite(state.fov)) camera.fov = THREE.MathUtils.clamp(state.fov, 5, 120);
+    camera.updateProjectionMatrix();
+    controls.update();
+  }
+  updateAnimHud();
+  markDirty();
+  log(`state restored camera=${Boolean(cameraPosition && targetPosition)} root=${rootMotionEnabled} clip=${activeClipIndex + 1} playing=${animationPlaying}`);
+  return Boolean(cameraPosition && targetPosition);
+}
+function scheduleFrame() {
+  if (renderPaused || animationHandle) return;
+  animationHandle = requestAnimationFrame(animate);
+}
+function scheduleDelayedFrame(ms) {
+  if (renderPaused) return;
+  const delay = Math.max(0, Math.min(2200, ms));
+  if (delayedFrameTimer) clearTimeout(delayedFrameTimer);
+  delayedFrameTimer = setTimeout(() => { delayedFrameTimer = 0; scheduleFrame(); }, delay);
+}
+function markDirty() { modelDirty = true; scheduleFrame(); }
+function rendererMemoryText() {
+  const mem = renderer.info.memory;
+  const prog = renderer.info.programs ? renderer.info.programs.length : 0;
+  const heap = performance.memory ? ` heap=${Math.round(performance.memory.usedJSHeapSize / 1048576)}MB` : '';
+  return `geom=${mem.geometries} tex=${mem.textures} prog=${prog}${heap}`;
+}
+function normalizeRotationY(obj) {
+  const tau = Math.PI * 2;
+  if (!obj || Math.abs(obj.rotation.y) < tau) return;
+  obj.rotation.y = ((obj.rotation.y % tau) + tau) % tau;
+}
+function disposeWire() {
+  for (const overlay of wireOverlays) {
+    overlay.parent?.remove?.(overlay);
+    overlay.geometry?.dispose?.();
+    overlay.material?.dispose?.();
+  }
+  wireCache.clear();
+  wireOverlays = [];
+}
+function makeWireMaterial() {
+  const base = { color: clayEnabled ? 0x050505 : 0xff174f, depthTest: !wireXray, depthWrite: false, transparent: false, opacity: 1.0, toneMapped: false };
+  return new THREE.MeshBasicMaterial({ ...base, wireframe: true, side: THREE.DoubleSide });
+}
+function cloneGeometryForWire(mesh) {
+  const geometry = mesh.geometry.clone();
+  if (!geometry.getAttribute('normal')) geometry.computeVertexNormals();
+  const pos = geometry.getAttribute('position');
+  const normal = geometry.getAttribute('normal');
+  if (pos && normal && pos.count === normal.count) {
+    const epsilon = THREE.MathUtils.clamp(radius * 0.000045, 0.000015, 0.00026);
+    for (let i = 0; i < pos.count; i++) {
+      pos.setXYZ(i, pos.getX(i) + normal.getX(i) * epsilon, pos.getY(i) + normal.getY(i) * epsilon, pos.getZ(i) + normal.getZ(i) * epsilon);
+    }
+    pos.needsUpdate = true;
+  }
+  geometry.computeBoundingSphere();
+  return geometry;
+}
+function getWireEntry(mesh) {
+  let entry = wireCache.get(mesh.uuid);
+  if (!entry) { entry = { mesh, overlay: null }; wireCache.set(mesh.uuid, entry); }
+  return entry;
+}
+function getWireOverlay(mesh) {
+  const entry = getWireEntry(mesh);
+  if (entry.overlay) return entry.overlay;
+  const overlay = new THREE.Mesh(cloneGeometryForWire(mesh), makeWireMaterial());
+  overlay.userData.viewerWireOverlay = true;
+  overlay.name = 'viewer-wire-overlay';
+  overlay.matrixAutoUpdate = true;
+  overlay.position.set(0, 0, 0);
+  overlay.rotation.set(0, 0, 0);
+  overlay.scale.set(1, 1, 1);
+  overlay.frustumCulled = false;
+  overlay.visible = false;
+  mesh.add(overlay);
+  entry.overlay = overlay;
+  wireOverlays.push(overlay);
+  return overlay;
+}
+function applyWireAppearance() {
+  const color = clayEnabled ? 0x050505 : 0xff174f;
+  for (const overlay of wireOverlays) {
+    overlay.visible = false;
+    overlay.renderOrder = wireXray ? 999 : 30;
+    overlay.material.color.setHex(color);
+    overlay.material.depthTest = !wireXray;
+    overlay.material.needsUpdate = true;
+  }
+}
+function rebuildWire() {
+  if (!model) return;
+  let count = 0;
+  if (wireMode === 0) {
+    disposeWire();
+    markDirty();
+    log(`wire hidden mode=0 meshes=0 cached=0 xray=${wireXray} clay=${clayEnabled}`);
+    return;
+  }
+  applyWireAppearance();
+  for (const mesh of meshList()) {
+    const overlay = getWireOverlay(mesh);
+    overlay.visible = true;
+    overlay.renderOrder = wireXray ? 999 : 30;
+    overlay.material.color.setHex(clayEnabled ? 0x050505 : 0xff174f);
+    overlay.material.depthTest = !wireXray;
+    overlay.material.needsUpdate = true;
+    count += 1;
+  }
+  markDirty();
+  log(`wire shown mode=${wireMode} meshes=${count} cached=${wireOverlays.length} xray=${wireXray} clay=${clayEnabled}`);
+}
+function applyClay() {
+  for (const mesh of meshList()) {
+    if (!originalMaterials.has(mesh.uuid)) originalMaterials.set(mesh.uuid, mesh.material);
+    mesh.material = clayEnabled ? clayMaterial : originalMaterials.get(mesh.uuid);
+  }
+  rebuildWire();
+  markDirty();
+}
+function toggleWire() { wireMode = wireMode === 0 ? 1 : 0; rebuildWire(); const label = wireMode === 0 ? 'off' : 'tri surface'; setStatus(`Wireframe ${label}.`, true); markDirty(); }
+function toggleWireXray() { wireXray = !wireXray; rebuildWire(); setStatus(`Wireframe X-ray ${wireXray ? 'on' : 'off'}.`, true); markDirty(); }
+function toggleClay() { clayEnabled = !clayEnabled; applyClay(); setStatus(`Clay ${clayEnabled ? 'on' : 'off'}.`, true); log(`clay=${clayEnabled}`); }
+function applyLighting() {
+  const m = lightingModes[lightingIndex];
+  hemiLight.color.setHex(m.hemi[0]); hemiLight.groundColor.setHex(m.hemi[1]); hemiLight.intensity = m.hemi[2];
+  keyLight.color.setHex(m.key[0]); keyLight.intensity = m.key[1]; keyLight.position.set(m.key[2], m.key[3], m.key[4]);
+  fillLight.color.setHex(m.fill[0]); fillLight.intensity = m.fill[1]; fillLight.position.set(m.fill[2], m.fill[3], m.fill[4]);
+  rimLight.color.setHex(m.rim[0]); rimLight.intensity = m.rim[1]; rimLight.position.set(m.rim[2], m.rim[3], m.rim[4]);
+  renderer.toneMappingExposure = m.exposure;
+  markDirty();
+  log(`lighting=${m.label}`);
+}
+function toggleLighting() {
+  lightingIndex = (lightingIndex + 1) % lightingModes.length;
+  applyLighting();
+  showModePopup(`Light ${lightingIndex + 1}/${lightingModes.length}: ${lightingModes[lightingIndex].label}`);
+}
+function applyBackground() {
+  const b = backgroundModes[backgroundIndex];
+  root.style.background = b.mid;
+  renderer.setClearColor(new THREE.Color(b.mid), 1);
+  if (!hdriBackgroundEnabled) scene.background = new THREE.Color(b.mid);
+  markDirty();
+  log(`background=${b.label}`);
+}
+function toggleBackground() {
+  backgroundIndex = (backgroundIndex + 1) % backgroundModes.length;
+  applyBackground();
+  showModePopup(`BG ${backgroundIndex + 1}/${backgroundModes.length}: ${backgroundModes[backgroundIndex].label}`);
+}
+async function applyHdri(show = true) {
+  const serial = ++hdriLoadSerial;
+  const opt = HDRI_OPTIONS[hdriIndex] || HDRI_OPTIONS[0];
+  if (!opt.url) {
+    scene.environment = null;
+    const b = backgroundModes[backgroundIndex];
+    scene.background = new THREE.Color(b.mid);
+    markDirty();
+    log(`hdri=${opt.label} none bg=${hdriBackgroundEnabled ? 'wanted' : 'off'}`);
+    if (show) showModePopup(`HDRI ${hdriIndex + 1}/${HDRI_OPTIONS.length}: ${opt.label}`);
+    return;
+  }
+  if (show) showModePopup(`HDRI ${hdriIndex + 1}/${HDRI_OPTIONS.length}: loading ${opt.label}`);
+  const started = performance.now();
+  try {
+    if (!hdriCache.has(opt.url)) {
+      const texture = await hdrLoader.loadAsync(opt.url);
+      if (serial !== hdriLoadSerial) { texture.dispose(); return; }
+      texture.mapping = THREE.EquirectangularReflectionMapping;
+      const envMap = pmremGenerator.fromEquirectangular(texture).texture;
+      envMap.userData = { label: opt.label, fixedWorld: true };
+      texture.dispose();
+      hdriCache.set(opt.url, envMap);
+      log(`hdri loaded ${opt.label} ms=${Math.round(performance.now() - started)} fixedWorld=true`);
+    } else {
+      log(`hdri cached ${opt.label}`);
+    }
+    const envMap = hdriCache.get(opt.url);
+    scene.environment = envMap;
+    if (hdriBackgroundEnabled) scene.background = envMap;
+    else {
+      const b = backgroundModes[backgroundIndex];
+      scene.background = new THREE.Color(b.mid);
+    }
+    markDirty();
+    if (show) showModePopup(`HDRI ${hdriIndex + 1}/${HDRI_OPTIONS.length}: ${opt.label}`);
+  } catch (err) {
+    console.error(err);
+    log(`hdri failed ${opt.label}: ${err}`);
+    if (show) showModePopup(`HDRI failed: ${opt.label}`);
+  }
+}
+function toggleHdri() {
+  hdriIndex = (hdriIndex + 1) % HDRI_OPTIONS.length;
+  applyHdri(true);
+}
+function toggleHdriBackground() {
+  hdriBackgroundEnabled = !hdriBackgroundEnabled;
+  const opt = HDRI_OPTIONS[hdriIndex] || HDRI_OPTIONS[0];
+  if (!hdriBackgroundEnabled) {
+    const b = backgroundModes[backgroundIndex];
+    scene.background = new THREE.Color(b.mid);
+    markDirty();
+    log('hdri background=flat');
+    showModePopup('Background: flat');
+    return;
+  }
+  if (!opt.url) {
+    const b = backgroundModes[backgroundIndex];
+    scene.background = new THREE.Color(b.mid);
+    markDirty();
+    log('hdri background requested but active hdri is none');
+    showModePopup('Background: no active HDRI');
+    return;
+  }
+  if (hdriCache.has(opt.url)) {
+    scene.background = hdriCache.get(opt.url);
+    markDirty();
+    log(`hdri background=${opt.label}`);
+    showModePopup(`Background: ${opt.label} HDRI`);
+    return;
+  }
+  showModePopup(`Background: loading ${opt.label}`);
+  applyHdri(false).then(() => {
+    const ready = hdriBackgroundEnabled && hdriCache.has(opt.url);
+    if (ready) {
+      scene.background = hdriCache.get(opt.url);
+      markDirty();
+      showModePopup(`Background: ${opt.label} HDRI`);
+    }
+  });
+}
+applyLighting();
+applyBackground();
+applyHdri(false);
+
+function activeLoader() {
+  if (MODEL_KIND === 'fbx') return new FBXLoader();
+  return new GLTFLoader();
+}
+function loadedRoot(loaded) {
+  return MODEL_KIND === 'fbx' ? loaded : loaded.scene;
+}
+function loadedAnimations(loaded) {
+  const clips = MODEL_KIND === 'fbx' ? loaded.animations : loaded.animations;
+  const valid = Array.isArray(clips) ? clips.filter((clip) => clip && clip.tracks?.length) : [];
+  return mergedObjectActionClips(valid);
+}
+function mergedObjectActionClips(clips) {
+  if (clips.length < 6) return clips;
+  const firstDuration = clips[0].duration || 0;
+  const sameDuration = clips.every((clip) => Math.abs((clip.duration || 0) - firstDuration) < 0.001);
+  const mostlyObjectActions = clips.filter((clip) => String(clip.name || '').endsWith('Action')).length >= Math.max(6, clips.length * 0.75);
+  if (!sameDuration || !mostlyObjectActions) return clips;
+  const tracks = [];
+  for (const clip of clips) tracks.push(...clip.tracks);
+  const merged = new THREE.AnimationClip('Scene', firstDuration, tracks);
+  log(`animation merge object-actions=${clips.length} duration=${formatAnimTime(firstDuration)}s tracks=${tracks.length}`);
+  return [merged];
+}
+function clipName(index) {
+  const clip = animationClips[index];
+  return clip?.name?.trim?.() || `Clip ${index + 1}`;
+}
+function formatAnimTime(value) {
+  if (!Number.isFinite(value)) return '0.00';
+  return Math.max(0, value).toFixed(2);
+}
+function updateAnimHud() {
+  if (!animationClips.length) {
+    animHud.style.display = 'none';
+    return;
+  }
+  const actionTime = activeAction ? activeAction.time % Math.max(0.001, animationDuration || activeAction.getClip().duration || 0.001) : 0;
+  animHud.style.display = 'block';
+  animHud.textContent = `${animationPlaying ? 'Playing' : 'Paused'} | ${activeClipIndex + 1}/${animationClips.length} ${clipName(activeClipIndex)} | ${formatAnimTime(actionTime)} / ${formatAnimTime(animationDuration)}s | ${animationSpeed.toFixed(2)}x | Root ${rootMotionEnabled ? 'on' : 'off'}`;
+}
+function normalizeBindingName(value) {
+  return String(value || '').replace(/^\./, '').replace(/\]$/, '').trim();
+}
+function objectNamed(name) {
+  const wanted = normalizeBindingName(name);
+  if (!wanted || !model) return null;
+  let found = null;
+  model.traverse((obj) => {
+    if (found) return;
+    if (obj.name === wanted || obj.uuid === wanted) found = obj;
+  });
+  return found;
+}
+function trackTargetName(trackName) {
+  const name = String(trackName || '');
+  const boneMatch = name.match(/bones\[([^\]]+)\]\.position$/);
+  if (boneMatch) return boneMatch[1];
+  const posIndex = name.lastIndexOf('.position');
+  if (posIndex < 0) return '';
+  return normalizeBindingName(name.slice(0, posIndex).split('.').pop());
+}
+function rootMotionScore(obj, targetName) {
+  const raw = String(targetName || obj?.name || '').toLowerCase();
+  const name = `${targetName || ''} ${obj?.name || ''}`.toLowerCase();
+  if (!obj) return 0;
+  if (obj === model) return 100;
+  if (name.includes('root_motion') || name.includes('rootmotion')) return 96;
+  if (raw === 'root' || /\broot\b/.test(name)) return 92;
+  if (name.includes('c_root_master') || name.includes('c_pos') || name.includes('root_ref')) return 88;
+  if (name.includes('armature') || raw === 'rig' || name.includes('skeleton')) return 80;
+  if (raw === 'hips' || raw === 'pelvis') return 78;
+  if (name.includes('hips') || name.includes('pelvis')) return 70;
+  return 0;
+}
+function positionTrackMotion(track) {
+  const values = track?.values;
+  if (!values || values.length < 6) return 0;
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+  for (let i = 0; i < values.length; i += 3) {
+    const x = values[i] || 0;
+    const z = values[i + 2] || 0;
+    minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+    minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z);
+  }
+  if (!Number.isFinite(minX) || !Number.isFinite(minZ)) return 0;
+  return Math.hypot(maxX - minX, maxZ - minZ);
+}
+function chooseRootMotionTarget(clip) {
+  if (!model || !clip) return null;
+  const candidates = [];
+  for (const track of clip.tracks || []) {
+    if (!String(track.name || '').endsWith('.position')) continue;
+    const motion = positionTrackMotion(track);
+    if (motion < 0.0001) continue;
+    const targetName = trackTargetName(track.name);
+    const obj = objectNamed(targetName);
+    if (!obj) continue;
+    const score = rootMotionScore(obj, targetName);
+    if (score > 0) candidates.push({ obj, targetName, score, motion });
+  }
+  candidates.sort((a, b) => (b.score + Math.log10(Math.max(1, b.motion))) - (a.score + Math.log10(Math.max(1, a.motion))));
+  const chosen = candidates[0];
+  if (!chosen) return null;
+  rootMotionTargetLabel = `${chosen.targetName || chosen.obj.name || 'object'} motion=${chosen.motion.toFixed(3)}`;
+  return chosen.obj;
+}
+function resetRootMotionCompensation(reason = 'reset') {
+  rootMotionTarget = null;
+  rootMotionStartLocal = null;
+  rootMotionBaseModelPosition = null;
+  rootMotionBaseModelQuaternion = null;
+  rootMotionLastActionTime = activeAction ? activeAction.time : -1;
+  rootMotionTargetLabel = 'none';
+  const clip = animationClips[activeClipIndex];
+  if (!model || !clip) return;
+  model.updateMatrixWorld(true);
+  rootMotionTarget = chooseRootMotionTarget(clip);
+  if (!rootMotionTarget) {
+    log(`root motion target=none reason=${reason}`);
+    return;
+  }
+  const startWorld = new THREE.Vector3();
+  rootMotionTarget.getWorldPosition(startWorld);
+  rootMotionStartLocal = model.worldToLocal(startWorld.clone());
+  rootMotionBaseModelPosition = (rootMotionHomePosition || model.position).clone();
+  rootMotionBaseModelQuaternion = (rootMotionHomeQuaternion || model.quaternion).clone();
+  log(`root motion target=${rootMotionTargetLabel} enabled=${rootMotionEnabled} reason=${reason}`);
+}
+function resetRootMotionToOrigin(resetClip = false) {
+  if (!model) return;
+  if (rootMotionHomePosition) model.position.copy(rootMotionHomePosition);
+  if (rootMotionHomeQuaternion) model.quaternion.copy(rootMotionHomeQuaternion);
+  if (activeAction && resetClip) {
+    const wasPaused = activeAction.paused;
+    activeAction.reset();
+    activeAction.paused = wasPaused;
+    animationPlaying = !wasPaused;
+    if (animationMixer) animationMixer.update(0);
+  }
+  model.updateMatrixWorld(true);
+}
+function applyRootMotionCompensation() {
+  if (rootMotionEnabled || !model || !activeAction) return;
+  if (!rootMotionTarget || !rootMotionStartLocal || !rootMotionBaseModelPosition || !rootMotionBaseModelQuaternion) resetRootMotionCompensation('lazy');
+  if (!rootMotionTarget || !rootMotionStartLocal || !rootMotionBaseModelPosition || !rootMotionBaseModelQuaternion) return;
+  const actionTime = activeAction.time || 0;
+  if (rootMotionLastActionTime >= 0 && actionTime < rootMotionLastActionTime - 0.02) {
+    resetRootMotionToOrigin(false);
+    resetRootMotionCompensation('loop');
+    rootMotionLastActionTime = actionTime;
+    markDirty();
+    return;
+  }
+  rootMotionLastActionTime = actionTime;
+  model.updateMatrixWorld(true);
+  const nowWorld = new THREE.Vector3();
+  rootMotionTarget.getWorldPosition(nowWorld);
+  const nowLocal = model.worldToLocal(nowWorld.clone());
+  const deltaLocal = new THREE.Vector3(nowLocal.x - rootMotionStartLocal.x, 0, nowLocal.z - rootMotionStartLocal.z);
+  const deltaWorld = deltaLocal.applyQuaternion(rootMotionBaseModelQuaternion);
+  model.position.x = rootMotionBaseModelPosition.x - deltaWorld.x;
+  model.position.z = rootMotionBaseModelPosition.z - deltaWorld.z;
+  model.updateMatrixWorld(true);
+}
+function toggleRootMotion() {
+  rootMotionEnabled = !rootMotionEnabled;
+  resetRootMotionToOrigin(true);
+  resetRootMotionCompensation('toggle');
+  updateAnimHud();
+  markDirty();
+  log(`rootMotion=${rootMotionEnabled} target=${rootMotionTargetLabel} resetOrigin=true`);
+  showModePopup(`Root motion ${rootMotionEnabled ? 'on' : 'off'} | reset origin`);
+}
+function applyAnimationSpeed() {
+  animationSpeed = animationSpeedLevels[animationSpeedIndex] || 1.0;
+  if (animationMixer) animationMixer.timeScale = animationSpeed;
+  updateAnimHud();
+  markDirty();
+  log(`animation speed=${animationSpeed.toFixed(2)}x`);
+}
+function changeAnimationSpeed(step) {
+  animationSpeedIndex = THREE.MathUtils.clamp(animationSpeedIndex + step, 0, animationSpeedLevels.length - 1);
+  applyAnimationSpeed();
+  showModePopup(`Animation speed ${animationSpeed.toFixed(2)}x`);
+}
+function playClip(index, auto = false) {
+  if (!animationMixer || !animationClips.length) return false;
+  const nextIndex = ((index % animationClips.length) + animationClips.length) % animationClips.length;
+  if (activeAction) activeAction.stop();
+  activeClipIndex = nextIndex;
+  const clip = animationClips[activeClipIndex];
+  activeAction = animationMixer.clipAction(clip);
+  activeAction.reset();
+  activeAction.enabled = true;
+  activeAction.paused = false;
+  activeAction.play();
+  animationPlaying = true;
+  animationDuration = clip.duration || 0;
+  applyAnimationSpeed();
+  resetRootMotionCompensation('clip');
+  updateAnimHud();
+  markDirty();
+  log(`animation clip=${activeClipIndex + 1}/${animationClips.length} name=${clipName(activeClipIndex)} duration=${formatAnimTime(animationDuration)}s auto=${auto}`);
+  if (!auto) showModePopup(`Animation: ${clipName(activeClipIndex)}`);
+  return true;
+}
+function toggleAnimationPlayback() {
+  if (!animationClips.length) { showModePopup('No animation clips'); return; }
+  if (!activeAction) { playClip(0); return; }
+  activeAction.paused = !activeAction.paused;
+  animationPlaying = !activeAction.paused;
+  updateAnimHud();
+  markDirty();
+  log(`animation ${animationPlaying ? 'play' : 'pause'} clip=${activeClipIndex + 1}/${animationClips.length} name=${clipName(activeClipIndex)}`);
+  showModePopup(`Animation ${animationPlaying ? 'playing' : 'paused'}: ${clipName(activeClipIndex)}`);
+}
+function restartAnimation() {
+  if (!activeAction && animationClips.length) { playClip(Math.max(0, activeClipIndex)); return; }
+  if (!activeAction) { showModePopup('No animation clips'); return; }
+  activeAction.reset();
+  activeAction.paused = false;
+  animationPlaying = true;
+  resetRootMotionCompensation('restart');
+  updateAnimHud();
+  markDirty();
+  log(`animation restart clip=${activeClipIndex + 1}/${animationClips.length} name=${clipName(activeClipIndex)}`);
+  showModePopup(`Animation restarted: ${clipName(activeClipIndex)}`);
+}
+function nextAnimationClip(step) {
+  if (!animationClips.length) { showModePopup('No animation clips'); return; }
+  playClip(activeClipIndex + step);
+}
+function setupBonePreview() {
+  const bones = boneList();
+  const meshes = meshList();
+  if (!bones.length || meshes.length) return bones.length;
+  skeletonHelper = new THREE.SkeletonHelper(model);
+  skeletonHelper.material.color.set(0xff4fbf);
+  skeletonHelper.material.depthTest = false;
+  skeletonHelper.renderOrder = 20;
+  scene.add(skeletonHelper);
+  log(`bone preview skeletonHelper=on bones=${bones.length}`);
+  return bones.length;
+}
+function setupAnimations(loaded) {
+  animationClips = loadedAnimations(loaded);
+  if (!animationClips.length) {
+    log('animations=0');
+    updateAnimHud();
+    return;
+  }
+  animationMixer = new THREE.AnimationMixer(model);
+  animationMixer.timeScale = animationSpeed;
+  autoRotate = false;
+  const summary = animationClips.map((clip, index) => `${index + 1}:${clipName(index)}:${formatAnimTime(clip.duration || 0)}s`).join(', ');
+  log(`animations=${animationClips.length} clips=${summary}`);
+  playClip(0, true);
+}
+activeLoader().load(MODEL_URL, (loaded) => {
+  model = loadedRoot(loaded);
+  scene.add(model);
+  rootMotionHomePosition = model.position.clone();
+  rootMotionHomeQuaternion = model.quaternion.clone();
+  setupBonePreview();
+  setupAnimations(loaded);
+  refreshBounds();
+  const restoredView = restoreViewerState(INITIAL_VIEW_STATE);
+  if (!restoredView) frameModel(false);
+  const meshes = meshList();
+  let materialCount = 0;
+  let textureCount = 0;
+  const seenTextures = new Set();
+  for (const mesh of meshes) {
+    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    materialCount += mats.filter(Boolean).length;
+    for (const mat of mats) {
+      if (!mat) continue;
+      for (const value of Object.values(mat)) {
+        if (value?.isTexture && !seenTextures.has(value.uuid)) { seenTextures.add(value.uuid); textureCount += 1; }
+      }
+    }
+  }
+  const bones = boneList().length;
+  log(`model loaded kind=${MODEL_KIND} meshes=${meshes.length} bones=${bones} materials=${materialCount} textures=${textureCount} animations=${animationClips.length} ${rendererMemoryText()}`);
+  const loadedText = animationClips.length ? `Loaded with ${animationClips.length} animation${animationClips.length === 1 ? '' : 's'}. Space play/pause.` : 'Loaded. Orbit LMB, smooth zoom MMB drag/wheel, pan RMB.';
+  setStatus(loadedText, true, 2600);
+}, undefined, (err) => {
+  console.error(err);
+  log(`model load failed kind=${MODEL_KIND}: ${err}`);
+  setStatus('Model failed to load.');
+});
+
+function animate(now = performance.now()) {
+  animationHandle = 0;
+  const rawDt = Math.max(0.0, now - lastRenderTime);
+  const dt = Math.min(0.05, Math.max(0.0, rawDt / 1000));
+  lastRenderTime = now;
+  frameStatsFrames += 1;
+  frameStatsMaxDt = Math.max(frameStatsMaxDt, rawDt);
+  const isSpike = rawDt > 35 && !document.hidden;
+  if (isSpike) {
+    frameStatsSpikeCount += 1;
+    if ((now - lastSpikeLogAt) > 900) {
+      lastSpikeLogAt = now;
+      const info = renderer.info.render;
+      log(`frame spike dt_ms=${Math.round(rawDt)} focused=${windowFocused} hidden=${document.hidden} wire=${wireMode} calls=${info.calls} tris=${info.triangles} pr=${renderer.getPixelRatio().toFixed(2)} dpr=${(window.devicePixelRatio || 1).toFixed(2)} mode=${renderModeLabel}`);
+    }
+  }
+  if (frameStatsLastHidden !== document.hidden || (now - frameStatsLastLogAt) > 10000) {
+    const elapsed = Math.max(1, now - frameStatsWindowStart);
+    const logElapsed = Math.max(1, now - frameStatsLastLogAt);
+    const info = renderer.info.render;
+    const avgRenderMs = renderStatsFrames ? (renderStatsTotalMs / renderStatsFrames) : 0;
+    log(`frame stats fps=${Math.round(frameStatsFrames * 1000 / logElapsed)} max_dt_ms=${Math.round(frameStatsMaxDt)} spikes=${frameStatsSpikeCount} render_ms_avg=${avgRenderMs.toFixed(2)} render_ms_max=${renderStatsMaxMs.toFixed(2)} focused=${windowFocused} hidden=${document.hidden} wire=${wireMode} calls=${info.calls} tris=${info.triangles} pr=${renderer.getPixelRatio().toFixed(2)} mode=${renderModeLabel} elapsed_s=${Math.round(elapsed / 1000)} frames=${renderedFramesTotal} ${rendererMemoryText()}`);
+    frameStatsLastLogAt = now;
+    frameStatsFrames = 0;
+    frameStatsMaxDt = 0;
+    frameStatsSpikeCount = 0;
+    renderStatsTotalMs = 0;
+    renderStatsMaxMs = 0;
+    renderStatsFrames = 0;
+    frameStatsLastHidden = document.hidden;
+  }
+  const pulseChanged = renderPaused ? false : updateFramePulse(now);
+  const animationActive = !renderPaused && animationMixer && animationPlaying && !document.hidden;
+  const animationChanged = Boolean(animationActive);
+  if (animationActive) {
+    animationMixer.update(dt);
+    applyRootMotionCompensation();
+    updateAnimHud();
+  }
+  const rotating = !renderPaused && autoRotate && model && !document.hidden && !controlsDragging && now >= autoRotatePauseUntil;
+  if (rotating) { model.rotation.y = (model.rotation.y + dt * 0.42) % (Math.PI * 2); markDirty(); }
+  const controlsChanged = renderPaused ? false : controls.update(dt);
+  const shouldRender = !renderPaused && (modelDirty || controlsChanged || rotating || pulseChanged || animationChanged);
+  if (shouldRender) {
+    normalizeRotationY(model);
+    renderer.info.reset();
+    const renderStarted = performance.now();
+    renderer.render(scene, camera);
+    const renderMs = performance.now() - renderStarted;
+    renderStatsTotalMs += renderMs;
+    renderStatsMaxMs = Math.max(renderStatsMaxMs, renderMs);
+    renderStatsFrames += 1;
+    renderedFramesTotal += 1;
+    modelDirty = false;
+  }
+  if (diagnosticsVisible) {
+    const info = renderer.info.render;
+    const recentFps = Math.round(frameStatsFrames * 1000 / Math.max(250, now - frameStatsLastLogAt));
+    diagnostics.textContent =
+      `fps ${recentFps}  maxdt ${Math.round(frameStatsMaxDt)}ms  spikes ${frameStatsSpikeCount}
+` +
+      `focused ${windowFocused}  hidden ${document.hidden}  wire ${wireMode}  auto ${autoRotate}  paused ${renderPaused}
+` +
+      `mode ${renderModeLabel}  dirty ${modelDirty}  calls ${info.calls}  tris ${info.triangles}  lines ${info.lines}
+` +
+      `render avg ${renderStatsFrames ? (renderStatsTotalMs / renderStatsFrames).toFixed(2) : '0.00'}ms max ${renderStatsMaxMs.toFixed(2)}ms  frames ${renderedFramesTotal}
+` +
+      `${rendererMemoryText()}  pr ${renderer.getPixelRatio().toFixed(2)}  quality ${qualityModes[qualityIndex].label}  dpr ${(window.devicePixelRatio || 1).toFixed(2)}  size ${window.innerWidth}x${window.innerHeight}`;
+  }
+  const waitingForAutoRotate = autoRotate && model && !document.hidden && !controlsDragging && now < autoRotatePauseUntil;
+  const wantsContinuous = !renderPaused && (
+    rotating || animationActive || controlsDragging || middleZooming || framePulse || diagnosticsVisible || controlsChanged
+  );
+  if (wantsContinuous) scheduleFrame();
+  else if (waitingForAutoRotate) scheduleDelayedFrame(autoRotatePauseUntil - now);
+}
+scheduleFrame();
+window.addEventListener('focus', () => { windowFocused = true; });
+window.addEventListener('blur', () => { windowFocused = false; });
+document.addEventListener('visibilitychange', () => { markDirty(); log(`visibility hidden=${document.hidden}`); });
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  markDirty();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' && !e.repeat) { e.preventDefault(); toggleAnimationPlayback(); return; }
+  if (e.key === '[' && !e.repeat) { e.preventDefault(); nextAnimationClip(-1); return; }
+  if (e.key === ']' && !e.repeat) { e.preventDefault(); nextAnimationClip(1); return; }
+  if (e.key === '0' && !e.repeat) { e.preventDefault(); restartAnimation(); return; }
+  if ((e.key === 'r' || e.key === 'R') && !e.repeat) { e.preventDefault(); toggleRootMotion(); return; }
+  if ((e.key === '+' || e.key === '=') && !e.repeat) { e.preventDefault(); changeAnimationSpeed(1); return; }
+  if ((e.key === '-' || e.key === '_') && !e.repeat) { e.preventDefault(); changeAnimationSpeed(-1); return; }
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key === 'b' || e.key === 'B')) { e.preventDefault(); toggleHdriBackground(); return; }
+  if (e.key === 'm' || e.key === 'M') { showModePopup('Avatar swap'); return; }
+  if (e.key === 'f' || e.key === 'F') frameModel(true);
+  if (e.key === 'a' || e.key === 'A') toggleAutoRotate();
+  if (e.key === 'w' || e.key === 'W') toggleWire();
+  if (e.key === 'x' || e.key === 'X') toggleWireXray();
+  if (e.key === 'c' || e.key === 'C') toggleClay();
+  if (e.key === 'l' || e.key === 'L') toggleLighting();
+  if (e.key === 'h' || e.key === 'H') toggleHdri();
+  if (e.key === 'b' || e.key === 'B') toggleBackground();
+  if (e.key === 'd' || e.key === 'D') { diagnosticsVisible = !diagnosticsVisible; diagnostics.style.display = diagnosticsVisible ? 'block' : 'none'; markDirty(); log(`diagnostics=${diagnosticsVisible}`); }
+  if (e.key === 'q' || e.key === 'Q') toggleQuality();
+  if (e.key === 'p' || e.key === 'P') { renderPaused = !renderPaused; if (!renderPaused) markDirty(); log(`renderPaused=${renderPaused}`); showModePopup(`WebGL ${renderPaused ? 'paused' : 'running'}`); }
+});
+window.viewerShowModePopup = showModePopup;
+window.viewerSnapshotState = snapshotViewerState;
+window.viewerSnapshotStateJson = snapshotViewerStateJson;
+window.viewerResetCamera = resetCamera;
+window.viewerFrameModel = () => frameModel(true);
+window.viewerToggleAutoRotate = toggleAutoRotate;
+window.viewerToggleWire = toggleWire;
+window.viewerToggleWireXray = toggleWireXray;
+window.viewerToggleClay = toggleClay;
+window.viewerToggleLighting = toggleLighting;
+window.viewerToggleHdri = toggleHdri;
+window.viewerToggleHdriBackground = toggleHdriBackground;
+window.viewerToggleBackground = toggleBackground;
+window.viewerToggleDiagnostics = () => { diagnosticsVisible = !diagnosticsVisible; diagnostics.style.display = diagnosticsVisible ? 'block' : 'none'; markDirty(); log(`diagnostics=${diagnosticsVisible}`); };
+window.viewerToggleQuality = toggleQuality;
+window.viewerToggleRenderPause = () => { renderPaused = !renderPaused; if (!renderPaused) markDirty(); log(`renderPaused=${renderPaused}`); showModePopup(`WebGL ${renderPaused ? 'paused' : 'running'}`); };
+window.viewerToggleAnimationPlayback = toggleAnimationPlayback;
+window.viewerPreviousAnimationClip = () => nextAnimationClip(-1);
+window.viewerNextAnimationClip = () => nextAnimationClip(1);
+window.viewerRestartAnimation = restartAnimation;
+window.viewerToggleRootMotion = toggleRootMotion;
+window.viewerAnimationFaster = () => changeAnimationSpeed(1);
+window.viewerAnimationSlower = () => changeAnimationSpeed(-1);
+</script>
+</body>
+</html>

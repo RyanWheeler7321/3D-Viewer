@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="3D Viewer icon">
+<defs>
+  <linearGradient id="top" x1="40" y1="32" x2="88" y2="62" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#FFD3E6"/><stop offset="1" stop-color="#FF86B7"/>
+  </linearGradient>
+  <linearGradient id="left" x1="34" y1="48" x2="64" y2="98" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#FF4F93"/><stop offset="1" stop-color="#C21D66"/>
+  </linearGradient>
+  <linearGradient id="right" x1="94" y1="48" x2="64" y2="98" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#8E2A86"/><stop offset="1" stop-color="#4A1650"/>
+  </linearGradient>
+  <radialGradient id="shadow" cx="64" cy="104" r="30" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#000" stop-opacity="0.55"/><stop offset="1" stop-color="#000" stop-opacity="0"/>
+  </radialGradient>
+  <clipPath id="front"><rect x="0" y="68" width="128" height="60"/></clipPath>
+  <linearGradient id="bg" x1="16" y1="8" x2="112" y2="120" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#221629"/><stop offset="1" stop-color="#0f0c16"/>
+  </linearGradient>
+  <linearGradient id="rim" x1="0" y1="0" x2="128" y2="128" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#FF6FA8" stop-opacity="0.55"/>
+    <stop offset="0.45" stop-color="#FF6FA8" stop-opacity="0.08"/>
+    <stop offset="1" stop-color="#FF6FA8" stop-opacity="0.22"/>
+  </linearGradient>
+</defs>
+<path d="M24 0H104L128 24V104L104 128H24L0 104V24Z" fill="url(#bg)"/>
+<path d="M24.8 1.5H103.2L126.5 24.8V103.2L103.2 126.5H24.8L1.5 103.2V24.8Z" fill="none" stroke="url(#rim)" stroke-width="2"/>
+<path d="M32 10H96L118 32V96L96 118H32L10 96V32Z" fill="none" stroke="#3e3157" stroke-width="2"/>
+<ellipse cx="64" cy="104" rx="30" ry="6" fill="url(#shadow)"/>
+<g transform="rotate(-14 64 68)">
+  <ellipse cx="64" cy="68" rx="47" ry="14" fill="none" stroke="#FF7AA7" stroke-width="2.5" opacity="0.35"/>
+</g>
+<path d="M64 30L94 47L64 64L34 47Z" fill="url(#top)"/>
+<path d="M34 47L64 64V98L34 81Z" fill="url(#left)"/>
+<path d="M94 47L64 64V98L94 81Z" fill="url(#right)"/>
+<path d="M64 30L94 47V81L64 98L34 81V47Z" fill="none" stroke="#2A0F24" stroke-width="2" stroke-linejoin="round" opacity="0.6"/>
+<path d="M34 47L64 64L94 47M64 64V98" fill="none" stroke="#FFE6F1" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="0.85"/>
+<path d="M44 47L64 36L84 47" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="0.45"/>
+<g transform="rotate(-14 64 68)" clip-path="url(#front)">
+  <ellipse cx="64" cy="68" rx="47" ry="14" fill="none" stroke="#FF8FB8" stroke-width="3"/>
+</g>
+<g transform="rotate(-14 64 68)"><circle cx="104" cy="75" r="4.5" fill="#FFE3F0"/></g>
+</svg>
