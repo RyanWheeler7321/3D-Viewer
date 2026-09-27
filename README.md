@@ -6,7 +6,7 @@
 
 I made this quickly because I wanted a faster way to look at 3D assets without opening Blender, Unity or another heavier tool every time. You can open a model, move around it, and check the lighting, textures, topology, wireframe or clay view, etc.
 
-It opens `.glb`, `.gltf`, `.fbx`, and `.zip` files, including zipped glTF or GLB models. Animated models can play in place, animation files with only bones show a simple skeleton, and you can group model variants with a small `viewer_variants.json` file next to the model to compare them. There's a sample model included, and the Poly Haven HDRIs are optional.
+It opens `.glb`, `.gltf`, `.fbx`, and `.zip` files, including zipped glTF or GLB models. Root motion can be turned off for animated models, animation files with only bones show a simple skeleton, and you can group model variants with a small `viewer_variants.json` file next to the model to compare them. There's a sample model included, and the Poly Haven HDRIs are optional.
 
 It's a small Python app using PySide6, with the Three.js viewer running in a QtWebEngine view.
 
