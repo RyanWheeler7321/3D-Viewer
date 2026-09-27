@@ -6,9 +6,9 @@
 
 I made this quickly because I wanted a faster way to look at 3D assets without opening Blender, Unity or another heavier tool every time. You can open a model, move around it, and check the lighting, textures, topology, wireframe or clay view, etc.
 
-It opens `.glb`, `.gltf`, `.fbx`, and `.zip` files, including zipped glTF/GLB bundles. Animated models can be played in place, bone-only animation files get a simple skeleton preview, and a small sidecar file can group model variants for quick comparison. The repo also includes a sample model and works without the optional Poly Haven HDRIs.
+It opens `.glb`, `.gltf`, `.fbx`, and `.zip` files, including zipped glTF or GLB models. Animated models can play in place, animation files with only bones show a simple skeleton, and you can group model variants with a small `viewer_variants.json` file next to the model to compare them. There's a sample model included, and the Poly Haven HDRIs are optional.
 
-It runs as a small Python/PySide6 desktop app with an embedded QtWebEngine view for the local Three.js viewer.
+It's a small Python app using PySide6, with the Three.js viewer running in a QtWebEngine view.
 
 ## Quick start
 
@@ -17,7 +17,7 @@ python -m pip install -r requirements.txt
 python viewer.py
 ```
 
-With no model it opens the bundled sample. You can also pass a model path, or `--last` to reopen the last one:
+With no model it opens the sample. You can also pass a model path, or `--last` to reopen the last one:
 
 ```bash
 python viewer.py path/to/model.glb
@@ -34,8 +34,8 @@ python viewer.py --last
 - `Space`: play or pause embedded animation clips
 - `[` / `]`: previous or next animation clip
 - `0`: restart current animation clip
-- `R`: toggle root-motion compensation for in-place preview
-- `M`: swap avatar/model variants when a `.viewer_variants.json` sidecar exists, without changing camera/root/playback settings
+- `R`: toggle root motion
+- `M`: swap model variants
 - `+` / `-`: animation speed
 - `A`: auto-rotate
 - `W`: wireframe
@@ -48,7 +48,7 @@ python viewer.py --last
 - `D`: diagnostics overlay
 - `Q`: quality mode
 - `T`: always-on-top
-- `P`: pause WebGL
+- `P`: pause rendering
 - `I`: write a process snapshot to the log
 - `Ctrl+O`: open another model in the same window
 - `O`: open the model folder
